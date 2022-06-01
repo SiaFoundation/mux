@@ -1,4 +1,4 @@
-# [![Sia Core](https://sia.tech/banners/sia-banner-mountains.png)](http://sia.tech)
+# [![Sia Core](https://sia.tech/banners/sia-banner-mux.png)](http://sia.tech)
 
 [![GoDoc](https://godoc.org/go.sia.tech/mux?status.svg)](https://godoc.org/go.sia.tech/mux)
 
