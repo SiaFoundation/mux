@@ -9,17 +9,6 @@ import (
 	"lukechampine.com/frand"
 )
 
-// The SiaMux protocol multiplexes many independent streams of data over a
-// single connection by chunking them into "frames." A frame consists of a
-// header (indicating which stream the frame belongs to) followed by raw stream
-// data.
-//
-// SiaMux also encrypts the underlying transport at the packet level. Here, a
-// "packet" does not necessarily correspond to the actual IP packets sent over
-// the wire; it is merely our atomic unit of transfer. A sender must pad their
-// messages to the next packet boundary, and a receiver must read a full packet
-// before it can perform any processing. Thus, to keep latency low, a single
-// frame should not be split across multiple packets.
 //
 // However, multiple frames may be stored within a single packet. After a
 // receiver decodes a frame, it checks for the presence of another frame within
@@ -40,8 +29,7 @@ const (
 )
 
 const (
-	idErrorBadInit = iota // should never be seen
-	idKeepalive           // empty frame to keep connection open
+	idKeepalive = iota // empty frame to keep connection open
 
 	idLowestStream = 1 << 8 // IDs below this value are reserved
 )

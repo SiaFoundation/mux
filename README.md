@@ -11,7 +11,7 @@ with other multiplexers available at the time.
 
 As a privacy-focused multiplexer, SiaMux behaves differently from other muxes.
 It transparently encrypts the connection, and supports authentication via
-Ed25519 public keys. To hinder metadata analysis, It always writes data in
+Ed25519 public keys. To hinder metadata analysis, it always writes data in
 fixed-size "packets," inserting padding as necessary. Lastly, SiaMux implements
 a unique feature known as *covert streams*. Covert streams hide their data
 within the padding of other streams, making them completely undetectable to
@@ -47,7 +47,7 @@ io.Copy(os.Stdout, s)
 For authenticated communication, use `mux.Dial`/`mux.Accept` with a
 `crypto/ed25519` keypair.
 
-To create a covert stream use `m.DialCovertStream`. The accepting peer calls
+To create a covert stream, use `m.DialCovertStream`. The accepting peer calls
 `m.AcceptStream` as usual.
 
 ## Benchmarks

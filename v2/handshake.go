@@ -16,8 +16,6 @@ import (
 	"lukechampine.com/frand"
 )
 
-const ourVersion = 2
-
 func generateX25519KeyPair() (xsk, xpk [32]byte) {
 	frand.Read(xsk[:])
 	curve25519.ScalarBaseMult(&xpk, &xsk)
@@ -66,12 +64,12 @@ const connSettingsSize = 4 + 4
 
 func encodeConnSettings(buf []byte, cs connSettings) {
 	binary.LittleEndian.PutUint32(buf[0:], uint32(cs.PacketSize))
-	binary.LittleEndian.PutUint32(buf[4:], uint32(cs.MaxTimeout.Seconds()))
+	binary.LittleEndian.PutUint32(buf[4:], uint32(cs.MaxTimeout.Milliseconds()))
 }
 
 func decodeConnSettings(buf []byte) (cs connSettings) {
 	cs.PacketSize = int(binary.LittleEndian.Uint32(buf[0:]))
-	cs.MaxTimeout = time.Second * time.Duration(binary.LittleEndian.Uint32(buf[4:]))
+	cs.MaxTimeout = time.Millisecond * time.Duration(binary.LittleEndian.Uint32(buf[4:]))
 	return
 }
 
@@ -101,29 +99,21 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (cipher.AEAD, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
-	// write version and pubkey
-	buf := make([]byte, 1+32+64+connSettingsSize+chachaOverhead)
-	buf[0] = ourVersion
-	copy(buf[1:], xpk[:])
-	if _, err := conn.Write(buf[:1+32]); err != nil {
+	// write pubkey
+	buf := make([]byte, 32+64+connSettingsSize+chachaOverhead)
+	copy(buf[:], xpk[:])
+	if _, err := conn.Write(buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake request: %w", err)
 	}
-	// read version, pubkey, signature, and settings
-	if n, err := io.ReadAtLeast(conn, buf, 1); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could not read version: %w", err)
-	} else if buf[0] != ourVersion {
-		// respond with our version even if we're incompatible
-		buf[0] = ourVersion
-		conn.Write(buf[:1])
-		return nil, connSettings{}, fmt.Errorf("incompatible version (%d)", buf[0])
-	} else if _, err := io.ReadFull(conn, buf[n:]); err != nil {
+	// read pubkey, signature, and settings
+	if _, err := io.ReadFull(conn, buf[:]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read handshake response: %w", err)
 	}
 
 	// verify signature
 	var rxpk [32]byte
-	copy(rxpk[:], buf[1:][:32])
-	sig := buf[1+32:][:64]
+	copy(rxpk[:], buf[:32])
+	sig := buf[32:][:64]
 	sigHash := blake2b.Sum256(append(xpk[:], rxpk[:]...))
 	if !ed25519.Verify(theirKey, sigHash[:], sig) {
 		return nil, connSettings{}, errors.New("invalid signature")
@@ -156,35 +146,27 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (cipher.AEAD, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
-	// read version and pubkey
-	buf := make([]byte, 1+32+64+connSettingsSize+chachaOverhead)
-	if n, err := io.ReadAtLeast(conn, buf[:1+32], 1); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could not read version: %w", err)
-	} else if buf[0] != ourVersion {
-		// respond with our version even if we're incompatible
-		buf[0] = ourVersion
-		conn.Write(buf[:1])
-		return nil, connSettings{}, fmt.Errorf("incompatible version (%d)", buf[0])
-	} else if _, err := io.ReadFull(conn, buf[n:1+32]); err != nil {
+	// read pubkey
+	buf := make([]byte, 32+64+connSettingsSize+chachaOverhead)
+	if _, err := io.ReadFull(conn, buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read handshake request: %w", err)
 	}
 
 	// derive shared cipher
 	var rxpk [32]byte
-	copy(rxpk[:], buf[1:][:32])
+	copy(rxpk[:], buf[:32])
 	aead, err := deriveSharedAEAD(xsk, rxpk)
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
 
-	// write version, pubkey, signature, and settings
+	// write pubkey, signature, and settings
 	sigHash := blake2b.Sum256(append(rxpk[:], xpk[:]...))
 	sig := ed25519.Sign(ourKey, sigHash[:])
-	buf[0] = ourVersion
-	copy(buf[1:], xpk[:])
-	copy(buf[1+32:], sig)
-	encodeConnSettings(buf[1+32+64+chachaPoly1305NonceSize:], ourSettings)
-	encryptInPlace(buf[1+32+64:], aead)
+	copy(buf[:], xpk[:])
+	copy(buf[32:], sig)
+	encodeConnSettings(buf[32+64+chachaPoly1305NonceSize:], ourSettings)
+	encryptInPlace(buf[32+64:], aead)
 	if _, err := conn.Write(buf); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake response: %w", err)
 	}
