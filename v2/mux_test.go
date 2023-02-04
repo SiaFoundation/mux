@@ -519,13 +519,11 @@ func TestCovertStream(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// amount of data transferred should be the same as without covert stream
-	expWritten := 1 + // version
-		32 + // key exchange
+	expWritten := 32 + // key exchange
 		connSettingsSize + chachaOverhead + // settings
 		m.settings.PacketSize // "world"
 
-	expRead := 1 + // version
-		32 + 64 + // key exchange
+	expRead := 32 + 64 + // key exchange
 		connSettingsSize + chachaOverhead + // settings
 		m.settings.PacketSize // "hello, world!"
 

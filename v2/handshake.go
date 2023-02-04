@@ -127,8 +127,8 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 
 	// decrypt settings
 	var mergedSettings connSettings
-	if plaintext, err := decryptInPlace(buf[1+32+64:], aead); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could not decrypt settings response: %w", err)
+	if plaintext, err := decryptInPlace(buf[32+64:], aead); err != nil {
+		return nil, connSettings{}, fmt.Errorf("could1 not decrypt settings response: %w", err)
 	} else if mergedSettings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}
@@ -176,7 +176,7 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	if _, err := io.ReadFull(conn, buf[:connSettingsSize+chachaOverhead]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read settings response: %w", err)
 	} else if plaintext, err := decryptInPlace(buf[:connSettingsSize+chachaOverhead], aead); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could not decrypt settings response: %w", err)
+		return nil, connSettings{}, fmt.Errorf("could2 not decrypt settings response: %w", err)
 	} else if settings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}
