@@ -32,5 +32,3 @@ jobs:
         uses: n8maninger/action-golang-test@v1
         with:
           args: "-race"
-      - name: Build
-        run: CGO_ENABLED=1 go build -o bin/ ./cmd/hostd
