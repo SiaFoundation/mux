@@ -10,6 +10,7 @@ In brief, v2 differs from v1 as follows:
 - The keepalive ID is 0, not 1
 - The shared secret is hashed before use
 - Encryption is per-packet, not per-frame
+- Nonces are sequential and implicit, not random and explicit
 - Support for "covert frames" was added
 
 
@@ -37,17 +38,19 @@ The *dialing peer* generates an X25519 keypair and sends:
 
 The current version is 2.
 
-The *accepting* peer derives the shared X25519 secret, hashes it for use as a
-ChaCha20-Poly1305 key, and responds with:
+The *accepting* peer derives the shared X25519 secret, hashes it with BLAKE2b
+for use as a ChaCha20-Poly1305 key, hashes that key *again* to derive the
+initial nonce value, and responds with:
 
 | Length | Type   | Description        |
 |--------|--------|--------------------|
 |   0    | uint8  | Version            |
 |   32   | []byte | X25519 pubkey      |
 |   64   | []byte | Ed25519 signature  |
-|   36   |        | Encrypted settings |
+|   24   |        | Encrypted settings |
 
-Finally, the dialing peer derives the shared secret and responds with its own encrypted settings.
+Finally, the dialing peer derives the shared secret and responds with its own
+encrypted settings.
 
 The settings are:
 
@@ -56,8 +59,8 @@ The settings are:
 |   4    | uint32 | Packet size | 1220-32768     |
 |   4    | uint32 | Max timeout | 120000-7200000 |
 
-Settings are encrypted in the same manner as [Packets](#packets): a 12-byte
-nonce, a ciphertext (8 bytes in this case), and a 16-byte tag.
+Settings are encrypted in the same manner as [Packets](#packets): a ciphertext
+(8 bytes in this case) followed by a 16-byte tag.
 
 Peers agree upon settings by choosing the minimum of the two packet sizes and
 the maximum of the two timeouts. The timeout is an integer number of
@@ -102,18 +105,20 @@ Frames are sent in fixed-length, encrypted *packets*:
 
 | Length | Type   | Description    |
 |--------|--------|----------------|
-|   12   | []byte | ChaCha20 nonce |
 |   n    | []byte | Ciphertext     |
 |   16   | []byte | Poly1305 tag   |
 
-Where `n = packetSize - (12 + 16)`.
+Where `n = packetSize - 16`.
 
 The decrypted ciphertext contains one or more concatenated frames, padded to `n`
 with `0x00` bytes. (Any byte other than `0x00` indicates another frame.) Frames
 must not be split across packet boundaries. (In other words, the maximum size of
 a frame's payload is `n - (4 + 2 + 2)`.)
 
-The nonce should be chosen randomly for each packet.
+A separate nonce is tracked for both the dialing and accepting peer, incremented
+after each use. The initial value for both nonces is the first 12 bytes of
+BLAKE2b(BLAKE2b(shared secret)). To increment a nonce, interpret its leading 8
+bytes as a 64-bit unsigned integer.
 
 ### Covert Frames
 

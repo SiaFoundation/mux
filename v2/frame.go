@@ -1,12 +1,9 @@
 package mux
 
 import (
-	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
-
-	"lukechampine.com/frand"
 )
 
 //
@@ -37,7 +34,6 @@ const (
 const (
 	chachaPoly1305NonceSize = 12
 	chachaPoly1305TagSize   = 16
-	chachaOverhead          = chachaPoly1305NonceSize + chachaPoly1305TagSize
 )
 
 type frameHeader struct {
@@ -61,17 +57,6 @@ func decodeFrameHeader(buf []byte) (h frameHeader) {
 	return
 }
 
-func encryptInPlace(buf []byte, aead cipher.AEAD) {
-	nonce, plaintext := buf[:chachaPoly1305NonceSize], buf[chachaPoly1305NonceSize:len(buf)-chachaPoly1305TagSize]
-	frand.Read(nonce)
-	aead.Seal(plaintext[:0], nonce, plaintext, nil)
-}
-
-func decryptInPlace(buf []byte, aead cipher.AEAD) ([]byte, error) {
-	nonce, ciphertext := buf[:chachaPoly1305NonceSize], buf[chachaPoly1305NonceSize:]
-	return aead.Open(ciphertext[:0], nonce, ciphertext, nil)
-}
-
 func appendFrame(buf []byte, h frameHeader, payload []byte) []byte {
 	frame := buf[len(buf):][:frameHeaderSize+len(payload)]
 	encodeFrameHeader(frame[:frameHeaderSize], h)
@@ -81,7 +66,7 @@ func appendFrame(buf []byte, h frameHeader, payload []byte) []byte {
 
 type packetReader struct {
 	r          io.Reader
-	aead       cipher.AEAD
+	cipher     *seqCipher
 	packetSize int
 
 	buf       []byte
@@ -105,7 +90,7 @@ func (pr *packetReader) Read(p []byte) (int, error) {
 			pr.buf = pr.buf[:len(pr.buf)+n]
 			pr.encrypted = pr.buf
 		}
-		decrypted, err := decryptInPlace(pr.encrypted[:pr.packetSize], pr.aead)
+		decrypted, err := pr.cipher.decryptInPlace(pr.encrypted[:pr.packetSize])
 		if err != nil {
 			return 0, err
 		}
@@ -168,14 +153,14 @@ func (pr *packetReader) nextFrame(buf []byte) (frameHeader, []byte, bool, error)
 	return h, buf[:h.length], false, nil
 }
 
-func encryptPackets(buf []byte, p []byte, packetSize int, aead cipher.AEAD) []byte {
-	maxFrameSize := packetSize - chachaOverhead
+func encryptPackets(buf []byte, p []byte, packetSize int, cipher *seqCipher) []byte {
+	maxFrameSize := packetSize - chachaPoly1305TagSize
 	numPackets := len(p) / maxFrameSize
 	for i := 0; i < numPackets; i++ {
 		packet := buf[i*packetSize:][:packetSize]
 		plaintext := p[i*maxFrameSize:][:maxFrameSize]
-		copy(packet[chachaPoly1305NonceSize:], plaintext)
-		encryptInPlace(packet, aead)
+		copy(packet, plaintext)
+		cipher.encryptInPlace(packet)
 	}
 	return buf[:numPackets*packetSize]
 }
