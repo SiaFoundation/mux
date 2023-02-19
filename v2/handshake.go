@@ -22,7 +22,29 @@ func generateX25519KeyPair() (xsk, xpk [32]byte) {
 	return
 }
 
-func deriveSharedAEAD(xsk, xpk [32]byte) (cipher.AEAD, error) {
+type seqCipher struct {
+	aead       cipher.AEAD
+	ourNonce   [chachaPoly1305NonceSize]byte
+	theirNonce [chachaPoly1305NonceSize]byte
+}
+
+func incNonce(nonce []byte) {
+	binary.LittleEndian.PutUint64(nonce, binary.LittleEndian.Uint64(nonce)+1)
+}
+
+func (c *seqCipher) encryptInPlace(buf []byte) {
+	plaintext := buf[:len(buf)-chachaPoly1305TagSize]
+	c.aead.Seal(plaintext[:0], c.ourNonce[:], plaintext, nil)
+	incNonce(c.ourNonce[:])
+}
+
+func (c *seqCipher) decryptInPlace(buf []byte) ([]byte, error) {
+	plaintext, err := c.aead.Open(buf[:0], c.theirNonce[:], buf, nil)
+	incNonce(c.theirNonce[:])
+	return plaintext, err
+}
+
+func deriveSharedCipher(xsk, xpk [32]byte) (*seqCipher, error) {
 	// NOTE: an error is only possible here if xpk is a "low-order point."
 	// Basically, if the other party chooses one of these points as their public
 	// key, then the resulting "secret" can be derived by anyone who observes
@@ -37,7 +59,17 @@ func deriveSharedAEAD(xsk, xpk [32]byte) (cipher.AEAD, error) {
 		return nil, err
 	}
 	key := blake2b.Sum256(secret)
-	return chacha20poly1305.New(key[:])
+	c, err := chacha20poly1305.New(key[:])
+	if err != nil {
+		return nil, err
+	}
+	// hash the key again to get the initial nonce value
+	nonce := blake2b.Sum256(key[:])
+	return &seqCipher{
+		aead:       c,
+		ourNonce:   *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
+		theirNonce: *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
+	}, err
 }
 
 type connSettings struct {
@@ -46,7 +78,7 @@ type connSettings struct {
 }
 
 func (cs connSettings) maxFrameSize() int {
-	return cs.PacketSize - chachaOverhead
+	return cs.PacketSize - chachaPoly1305TagSize
 }
 
 func (cs connSettings) maxPayloadSize() int {
@@ -96,11 +128,11 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 	return merged, nil
 }
 
-func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (cipher.AEAD, connSettings, error) {
+func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// write pubkey
-	buf := make([]byte, 32+64+connSettingsSize+chachaOverhead)
+	buf := make([]byte, 32+64+connSettingsSize+chachaPoly1305TagSize)
 	copy(buf[:], xpk[:])
 	if _, err := conn.Write(buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake request: %w", err)
@@ -120,34 +152,34 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 	}
 
 	// derive shared cipher
-	aead, err := deriveSharedAEAD(xsk, rxpk)
+	cipher, err := deriveSharedCipher(xsk, rxpk)
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
 
 	// decrypt settings
 	var mergedSettings connSettings
-	if plaintext, err := decryptInPlace(buf[32+64:], aead); err != nil {
+	if plaintext, err := cipher.decryptInPlace(buf[32+64:]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could1 not decrypt settings response: %w", err)
 	} else if mergedSettings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}
 
 	// encrypt + write our settings
-	encodeConnSettings(buf[chachaPoly1305NonceSize:], ourSettings)
-	encryptInPlace(buf[:connSettingsSize+chachaOverhead], aead)
-	if _, err := conn.Write(buf[:connSettingsSize+chachaOverhead]); err != nil {
+	encodeConnSettings(buf[:], ourSettings)
+	cipher.encryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize])
+	if _, err := conn.Write(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write settings: %w", err)
 	}
 
-	return aead, mergedSettings, nil
+	return cipher, mergedSettings, nil
 }
 
-func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (cipher.AEAD, connSettings, error) {
+func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// read pubkey
-	buf := make([]byte, 32+64+connSettingsSize+chachaOverhead)
+	buf := make([]byte, 32+64+connSettingsSize+chachaPoly1305TagSize)
 	if _, err := io.ReadFull(conn, buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read handshake request: %w", err)
 	}
@@ -155,7 +187,7 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	// derive shared cipher
 	var rxpk [32]byte
 	copy(rxpk[:], buf[:32])
-	aead, err := deriveSharedAEAD(xsk, rxpk)
+	cipher, err := deriveSharedCipher(xsk, rxpk)
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
@@ -165,21 +197,21 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	sig := ed25519.Sign(ourKey, sigHash[:])
 	copy(buf[:], xpk[:])
 	copy(buf[32:], sig)
-	encodeConnSettings(buf[32+64+chachaPoly1305NonceSize:], ourSettings)
-	encryptInPlace(buf[32+64:], aead)
+	encodeConnSettings(buf[32+64:], ourSettings)
+	cipher.encryptInPlace(buf[32+64:])
 	if _, err := conn.Write(buf); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake response: %w", err)
 	}
 
 	// read + decrypt settings
 	var settings connSettings
-	if _, err := io.ReadFull(conn, buf[:connSettingsSize+chachaOverhead]); err != nil {
+	if _, err := io.ReadFull(conn, buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read settings response: %w", err)
-	} else if plaintext, err := decryptInPlace(buf[:connSettingsSize+chachaOverhead], aead); err != nil {
+	} else if plaintext, err := cipher.decryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could2 not decrypt settings response: %w", err)
 	} else if settings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}
 
-	return aead, settings, nil
+	return cipher, settings, nil
 }

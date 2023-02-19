@@ -520,11 +520,11 @@ func TestCovertStream(t *testing.T) {
 
 	// amount of data transferred should be the same as without covert stream
 	expWritten := 32 + // key exchange
-		connSettingsSize + chachaOverhead + // settings
+		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "world"
 
 	expRead := 32 + 64 + // key exchange
-		connSettingsSize + chachaOverhead + // settings
+		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "hello, world!"
 
 	w := int(atomic.LoadInt32(&conn.(*statsConn).w))
@@ -600,13 +600,14 @@ func BenchmarkConn(b *testing.B) {
 			}
 			defer conn.Close()
 			aead, _ := chacha20poly1305.New(encryptionKey)
+			cipher := &seqCipher{aead: aead}
 			buf := make([]byte, defaultConnSettings.PacketSize)
 			for {
 				_, err := io.ReadFull(conn, buf)
 				if err != nil {
 					return err
 				}
-				if _, err := decryptInPlace(buf, aead); err != nil {
+				if _, err := cipher.decryptInPlace(buf); err != nil {
 					return err
 				}
 			}
@@ -625,12 +626,13 @@ func BenchmarkConn(b *testing.B) {
 	defer conn.Close()
 
 	aead, _ := chacha20poly1305.New(encryptionKey)
+	cipher := &seqCipher{aead: aead}
 	buf := make([]byte, defaultConnSettings.PacketSize*10)
 	b.ResetTimer()
 	b.SetBytes(int64(defaultConnSettings.maxPayloadSize()))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		encryptInPlace(buf, aead)
+		cipher.encryptInPlace(buf)
 		if _, err := conn.Write(buf); err != nil {
 			b.Fatal(err)
 		}

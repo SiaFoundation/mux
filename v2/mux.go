@@ -3,7 +3,6 @@ package mux
 import (
 	"bytes"
 	"context"
-	"crypto/cipher"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -34,7 +33,7 @@ var (
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
 type Mux struct {
 	conn     net.Conn
-	aead     cipher.AEAD
+	cipher   *seqCipher
 	settings connSettings
 
 	// all subsequent fields are guarded by mu
@@ -184,7 +183,7 @@ func (m *Mux) writeLoop() {
 			}
 		}
 		// split into packets and encrypt
-		packets := encryptPackets(buf, m.writeBuf, m.settings.PacketSize, m.aead)
+		packets := encryptPackets(buf, m.writeBuf, m.settings.PacketSize, m.cipher)
 
 		// clear writeBuf and wake at most one bufferFrame call
 		m.writeBuf = m.writeBuf[:0]
@@ -212,7 +211,7 @@ func (m *Mux) readLoop() {
 	var curStream *Stream // saves a lock acquisition + map lookup in the common case
 	pr := &packetReader{
 		r:          m.conn,
-		aead:       m.aead,
+		cipher:     m.cipher,
 		packetSize: m.settings.PacketSize,
 		buf:        make([]byte, 0, m.settings.PacketSize*10),
 	}
@@ -361,10 +360,10 @@ func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
 }
 
 // newMux initializes a Mux and spawns its readLoop and writeLoop goroutines.
-func newMux(conn net.Conn, aead cipher.AEAD, settings connSettings) *Mux {
+func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 	m := &Mux{
 		conn:      conn,
-		aead:      aead,
+		cipher:    cipher,
 		settings:  settings,
 		streams:   make(map[uint32]*Stream),
 		nextID:    idLowestStream,
@@ -381,20 +380,20 @@ func newMux(conn net.Conn, aead cipher.AEAD, settings connSettings) *Mux {
 
 // Dial initiates a mux protocol handshake on the provided conn.
 func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
-	aead, settings, err := initiateHandshake(conn, theirKey, defaultConnSettings)
+	cipher, settings, err := initiateHandshake(conn, theirKey, defaultConnSettings)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
-	return newMux(conn, aead, settings), nil
+	return newMux(conn, cipher, settings), nil
 }
 
 // Accept reciprocates a mux protocol handshake on the provided conn.
 func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
-	aead, settings, err := acceptHandshake(conn, ourKey, defaultConnSettings)
+	cipher, settings, err := acceptHandshake(conn, ourKey, defaultConnSettings)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
-	m := newMux(conn, aead, settings)
+	m := newMux(conn, cipher, settings)
 	m.nextID++ // avoid collisions with Dialing peer
 	return m, nil
 }
