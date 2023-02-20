@@ -69,7 +69,7 @@ func deriveSharedCipher(xsk, xpk [32]byte) (*seqCipher, error) {
 		aead:       c,
 		ourNonce:   *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
 		theirNonce: *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
-	}, err
+	}, nil
 }
 
 type connSettings struct {
@@ -208,7 +208,7 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	if _, err := io.ReadFull(conn, buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read settings response: %w", err)
 	} else if plaintext, err := cipher.decryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could2 not decrypt settings response: %w", err)
+		return nil, connSettings{}, fmt.Errorf("could not decrypt settings response: %w", err)
 	} else if settings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}

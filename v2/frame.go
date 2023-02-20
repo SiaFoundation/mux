@@ -6,19 +6,6 @@ import (
 	"io"
 )
 
-//
-// However, multiple frames may be stored within a single packet. After a
-// receiver decodes a frame, it checks for the presence of another frame within
-// the packet by inspecting the next unread bit. A 1 bit indicates another
-// frame. (This bit is "stolen" from the stream ID; see encodeFrameHeader.) If
-// the bit is 0, the next unread bit is inspected. A 0 bit indicates padding:
-// the rest of the packet is discarded. A 1 bit indicates "covert stream data:"
-// the remaining 6 bits of the byte are discarded, and the remainder of the
-// packet is treated as a distinct stream of raw data. This data is buffered
-// until it comprises a full frame, whereupon it is decoded and processed as
-// usual and the covert buffer is reset. Since this covert data is only ever
-// sent in place of padding, it cannot be detected by traffic analysis.
-
 const (
 	flagFirst = 1 << iota // first frame in stream
 	flagLast              // stream is being closed gracefully
