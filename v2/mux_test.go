@@ -277,7 +277,7 @@ func TestDeadline(t *testing.T) {
 			// need to write a fairly large message; otherwise the packets just
 			// get buffered and "succeed" instantly
 			if _, err := s.Write(make([]byte, m1.settings.PacketSize*20)); err != nil {
-				return fmt.Errorf("foo: %w", err)
+				return err
 			} else if _, err := io.ReadFull(s, buf[:13]); err != nil {
 				return err
 			} else if string(buf) != "hello, world!" {
