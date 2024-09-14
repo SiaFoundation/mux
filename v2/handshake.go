@@ -133,12 +133,12 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 
 	// write pubkey
 	buf := make([]byte, 32+64+connSettingsSize+chachaPoly1305TagSize)
-	copy(buf[:], xpk[:])
+	copy(buf, xpk[:])
 	if _, err := conn.Write(buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake request: %w", err)
 	}
 	// read pubkey, signature, and settings
-	if _, err := io.ReadFull(conn, buf[:]); err != nil {
+	if _, err := io.ReadFull(conn, buf); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read handshake response: %w", err)
 	}
 
@@ -166,7 +166,7 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 	}
 
 	// encrypt + write our settings
-	encodeConnSettings(buf[:], ourSettings)
+	encodeConnSettings(buf, ourSettings)
 	cipher.encryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize])
 	if _, err := conn.Write(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write settings: %w", err)
@@ -195,7 +195,7 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	// write pubkey, signature, and settings
 	sigHash := blake2b.Sum256(append(rxpk[:], xpk[:]...))
 	sig := ed25519.Sign(ourKey, sigHash[:])
-	copy(buf[:], xpk[:])
+	copy(buf, xpk[:])
 	copy(buf[32:], sig)
 	encodeConnSettings(buf[32+64:], ourSettings)
 	cipher.encryptInPlace(buf[32+64:])
