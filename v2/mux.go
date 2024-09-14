@@ -66,6 +66,7 @@ func (m *Mux) setErr(err error) error {
 	for _, s := range m.streams {
 		s.cond.L.Lock()
 		s.err = err
+		s.readBuf = nil
 		s.cond.Broadcast()
 		s.cond.L.Unlock()
 	}
@@ -500,9 +501,12 @@ func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
 	// set payload and wait for it to be consumed
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
+	if s.err != nil {
+		return
+	}
 	s.readBuf = payload
 	s.cond.Broadcast() // wake Read
-	for len(s.readBuf) > 0 && s.err == nil && (s.rd.IsZero() || time.Now().Before(s.rd)) {
+	for len(s.readBuf) > 0 {
 		s.cond.Wait()
 	}
 }
@@ -516,27 +520,28 @@ func (s *Stream) Read(p []byte) (int, error) {
 		panic("mux: Read called before Write on newly-Dialed Stream")
 	}
 	if !s.rd.IsZero() {
-		if !time.Now().Before(s.rd) {
-			return 0, os.ErrDeadlineExceeded
-		}
-		timer := time.AfterFunc(time.Until(s.rd), s.cond.Broadcast)
-		defer timer.Stop()
+		defer time.AfterFunc(time.Until(s.rd), s.cond.Broadcast).Stop()
 	}
 	for len(s.readBuf) == 0 && s.err == nil && (s.rd.IsZero() || time.Now().Before(s.rd)) {
 		s.cond.Wait()
 	}
-	if s.err != nil {
-		if s.err == ErrPeerClosedStream {
-			return 0, io.EOF
-		}
-		return 0, s.err
-	} else if !s.rd.IsZero() && !time.Now().Before(s.rd) {
-		return 0, os.ErrDeadlineExceeded
-	}
 	n := copy(p, s.readBuf)
 	s.readBuf = s.readBuf[n:]
-	s.cond.Broadcast() // wake consumeFrame
-	return n, nil
+
+	err := s.err
+	if err == ErrPeerClosedStream {
+		err = io.EOF
+	} else if !(s.rd.IsZero() || time.Now().Before(s.rd)) {
+		err = os.ErrDeadlineExceeded
+	} else if err != nil {
+		s.readBuf = nil // if the error is fatal, drop the rest of the buffer
+	}
+	if len(s.readBuf) > 0 {
+		err = nil // if more data is available, silence the error
+	} else {
+		s.cond.Broadcast() // wake consumeFrame
+	}
+	return n, err
 }
 
 // Write writes data to the Stream.
@@ -590,6 +595,7 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.err = ErrClosedStream
+	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
 
