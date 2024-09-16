@@ -346,6 +346,9 @@ func (m *Mux) DialCovertStream() *Stream {
 //
 // Unlike e.g. net.Dial, this does not perform any I/O; the peer will not be
 // aware of the new Stream until Write is called.
+//
+// Deprecated: To associate a Stream with a context, use a helper function as
+// described here: https://github.com/SiaFoundation/mux/pull/2#issuecomment-2351171318
 func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
 	s := m.DialStream()
 	go func() {
