@@ -128,7 +128,7 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 	return merged, nil
 }
 
-func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, theirVersion uint8, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// write pubkey
@@ -142,12 +142,16 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 		return nil, connSettings{}, fmt.Errorf("could not read handshake response: %w", err)
 	}
 
-	// verify signature
+	// verify signature and derive shared cipher
 	var rxpk [32]byte
 	copy(rxpk[:], buf[:32])
+	msg := append(xpk[:], rxpk[:]...)
+	if theirVersion == 2 {
+		sigHash := blake2b.Sum256(msg)
+		msg = sigHash[:]
+	}
 	sig := buf[32:][:64]
-	sigHash := blake2b.Sum256(append(xpk[:], rxpk[:]...))
-	if !ed25519.Verify(theirKey, sigHash[:], sig) {
+	if !ed25519.Verify(theirKey, msg, sig) {
 		return nil, connSettings{}, errors.New("invalid signature")
 	}
 
@@ -155,6 +159,10 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 	cipher, err := deriveSharedCipher(xsk, rxpk)
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
+	}
+	if theirVersion > 2 {
+		// flip the most significant bit of their nonce
+		cipher.theirNonce[len(cipher.theirNonce)-1] ^= 0x80
 	}
 
 	// decrypt settings
@@ -175,7 +183,7 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 	return cipher, mergedSettings, nil
 }
 
-func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, theirVersion uint8, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// read pubkey
@@ -191,10 +199,18 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
+	if theirVersion > 2 {
+		// flip the most significant bit of our nonce
+		cipher.ourNonce[len(cipher.ourNonce)-1] ^= 0x80
+	}
 
 	// write pubkey, signature, and settings
-	sigHash := blake2b.Sum256(append(rxpk[:], xpk[:]...))
-	sig := ed25519.Sign(ourKey, sigHash[:])
+	msg := append(rxpk[:], xpk[:]...)
+	if theirVersion == 2 {
+		sigHash := blake2b.Sum256(msg)
+		msg = sigHash[:]
+	}
+	sig := ed25519.Sign(ourKey, msg)
 	copy(buf, xpk[:])
 	copy(buf[32:], sig)
 	encodeConnSettings(buf[32+64:], ourSettings)

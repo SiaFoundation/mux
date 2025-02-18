@@ -87,7 +87,7 @@ func TestMux(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := Accept(conn, serverKey)
+			m, err := Accept(conn, serverKey, 3)
 			if err != nil {
 				return err
 			}
@@ -111,7 +111,7 @@ func TestMux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey))
+	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
