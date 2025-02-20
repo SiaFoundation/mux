@@ -44,34 +44,6 @@ func (c *seqCipher) decryptInPlace(buf []byte) ([]byte, error) {
 	return plaintext, err
 }
 
-func deriveSharedCipher(xsk, xpk [32]byte) (*seqCipher, error) {
-	// NOTE: an error is only possible here if xpk is a "low-order point."
-	// Basically, if the other party chooses one of these points as their public
-	// key, then the resulting "secret" can be derived by anyone who observes
-	// the handshake, effectively rendering the protocol unencrypted. This would
-	// be a strange thing to do; the other party can decrypt the messages
-	// anyway, so if they want to make the messages public, nothing can stop
-	// them from doing so. Consequently, some people (notably djb himself) will
-	// tell you not to bother checking for low-order points at all. But why
-	// would we want to talk to a peer that's behaving weirdly?
-	secret, err := curve25519.X25519(xsk[:], xpk[:])
-	if err != nil {
-		return nil, err
-	}
-	key := blake2b.Sum256(secret)
-	c, err := chacha20poly1305.New(key[:])
-	if err != nil {
-		return nil, err
-	}
-	// hash the key again to get the initial nonce value
-	nonce := blake2b.Sum256(key[:])
-	return &seqCipher{
-		aead:       c,
-		ourNonce:   *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
-		theirNonce: *(*[chachaPoly1305NonceSize]byte)(nonce[:]),
-	}, nil
-}
-
 type connSettings struct {
 	PacketSize int
 	MaxTimeout time.Duration
@@ -128,7 +100,7 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 	return merged, nil
 }
 
-func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, theirVersion uint8, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// write pubkey
@@ -142,19 +114,46 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 		return nil, connSettings{}, fmt.Errorf("could not read handshake response: %w", err)
 	}
 
-	// verify signature
+	// verify signature and derive shared cipher
 	var rxpk [32]byte
 	copy(rxpk[:], buf[:32])
+	msg := append(xpk[:], rxpk[:]...)
+	if theirVersion == 2 {
+		sigHash := blake2b.Sum256(msg)
+		msg = sigHash[:]
+	}
 	sig := buf[32:][:64]
-	sigHash := blake2b.Sum256(append(xpk[:], rxpk[:]...))
-	if !ed25519.Verify(theirKey, sigHash[:], sig) {
+	if !ed25519.Verify(theirKey, msg, sig) {
 		return nil, connSettings{}, errors.New("invalid signature")
 	}
 
 	// derive shared cipher
-	cipher, err := deriveSharedCipher(xsk, rxpk)
+	secret, err := curve25519.X25519(xsk[:], rxpk[:])
 	if err != nil {
+		// NOTE: an error is only possible here if xpk is a "low-order point."
+		// Basically, if the other party chooses one of these points as their public
+		// key, then the resulting "secret" can be derived by anyone who observes
+		// the handshake, effectively rendering the protocol unencrypted. This would
+		// be a strange thing to do; the other party can decrypt the messages
+		// anyway, so if they want to make the messages public, nothing can stop
+		// them from doing so. Consequently, some people (notably djb himself) will
+		// tell you not to bother checking for low-order points at all. But why
+		// would we want to talk to a peer that's behaving weirdly?
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
+	}
+	var cipher *seqCipher
+	if theirVersion <= 2 {
+		key := blake2b.Sum256(secret)
+		aead, _ := chacha20poly1305.New(key[:]) // no error possible
+		cipher = &seqCipher{aead: aead}
+		nonce := blake2b.Sum256(key[:])
+		copy(cipher.ourNonce[:], nonce[:])
+		copy(cipher.theirNonce[:], nonce[:])
+	} else {
+		key := blake2b.Sum256(append(append(secret, xpk[:]...), rxpk[:]...))
+		aead, _ := chacha20poly1305.New(key[:]) // no error possible
+		cipher = &seqCipher{aead: aead}
+		cipher.theirNonce[len(cipher.theirNonce)-1] ^= 0x80
 	}
 
 	// decrypt settings
@@ -175,7 +174,7 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 	return cipher, mergedSettings, nil
 }
 
-func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, theirVersion uint8, ourSettings connSettings) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// read pubkey
@@ -187,14 +186,34 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 	// derive shared cipher
 	var rxpk [32]byte
 	copy(rxpk[:], buf[:32])
-	cipher, err := deriveSharedCipher(xsk, rxpk)
+
+	// derive shared cipher
+	secret, err := curve25519.X25519(xsk[:], rxpk[:])
 	if err != nil {
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
+	var cipher *seqCipher
+	if theirVersion <= 2 {
+		key := blake2b.Sum256(secret)
+		aead, _ := chacha20poly1305.New(key[:])
+		cipher = &seqCipher{aead: aead}
+		nonce := blake2b.Sum256(key[:])
+		copy(cipher.ourNonce[:], nonce[:])
+		copy(cipher.theirNonce[:], nonce[:])
+	} else {
+		key := blake2b.Sum256(append(append(secret, rxpk[:]...), xpk[:]...))
+		aead, _ := chacha20poly1305.New(key[:])
+		cipher = &seqCipher{aead: aead}
+		cipher.ourNonce[len(cipher.ourNonce)-1] ^= 0x80
+	}
 
 	// write pubkey, signature, and settings
-	sigHash := blake2b.Sum256(append(rxpk[:], xpk[:]...))
-	sig := ed25519.Sign(ourKey, sigHash[:])
+	msg := append(rxpk[:], xpk[:]...)
+	if theirVersion == 2 {
+		sigHash := blake2b.Sum256(msg)
+		msg = sigHash[:]
+	}
+	sig := ed25519.Sign(ourKey, msg)
 	copy(buf, xpk[:])
 	copy(buf[32:], sig)
 	encodeConnSettings(buf[32+64:], ourSettings)

@@ -23,7 +23,7 @@ when a "final" frame is sent, or (forcibly) when the connection is closed.
 The session is encrypted and authenticated: the dialer must know their peer's
 Ed25519 public key, which is used to sign the handshake and thereby derive a
 shared secret. This secret is then used to encrypt each frame with
-ChaCha20-Poly1305.
+ChaCha20-Poly1305, incrementing the nonce after each packet.
 
 All integers in this spec are little-endian.
 
@@ -33,24 +33,25 @@ The *dialing peer* generates an X25519 keypair and sends:
 
 | Length | Type   | Description   |
 |--------|--------|---------------|
-|   0    | uint8  | Version       |
+|   1    | uint8  | Version       |
 |   32   | []byte | X25519 pubkey |
 
-The current version is 2.
+The current version is 3.
 
-The *accepting* peer derives the shared X25519 secret, hashes it with BLAKE2b
-for use as a ChaCha20-Poly1305 key, hashes that key *again* to derive the
-initial nonce value, and responds with:
+The *accepting* peer generates an X25519 keypair, derives the shared X25519
+secret, and computes the ChaCha20-Poly1305 key as `BLAKE2b(secret | k1 | k2)`,
+where `k1` is `k2` are the dialing and accepting X25519 pubkeys. It initialies
+its nonce to `0`, and responds with:
 
 | Length | Type   | Description        |
 |--------|--------|--------------------|
-|   0    | uint8  | Version            |
+|   1    | uint8  | Version            |
 |   32   | []byte | X25519 pubkey      |
 |   64   | []byte | Ed25519 signature  |
 |   24   |        | Encrypted settings |
 
-Finally, the dialing peer derives the shared secret and responds with its own
-encrypted settings.
+Finally, the dialing peer derives the same ChaCha20-Poly1305 key, initializes
+its nonce to `1<<95`, and responds with its own encrypted settings.
 
 The settings are:
 
@@ -60,7 +61,7 @@ The settings are:
 |   4    | uint32 | Max timeout | 120000-7200000 |
 
 Settings are encrypted in the same manner as [Packets](#packets): a ciphertext
-(8 bytes in this case) followed by a 16-byte tag.
+(8 bytes in this case) followed by a 16-byte authentication tag.
 
 Peers agree upon settings by choosing the minimum of the two packet sizes and
 the maximum of the two timeouts. The timeout is an integer number of
@@ -116,8 +117,8 @@ must not be split across packet boundaries. (In other words, the maximum size of
 a frame's payload is `n - (4 + 2 + 2)`.)
 
 A separate nonce is tracked for both the dialing and accepting peer, incremented
-after each use. The initial value for both nonces is the first 12 bytes of
-BLAKE2b(BLAKE2b(shared secret)). To increment a nonce, interpret its leading 8
+after each use. The initial nonce value is `0` for the dialing peer and `1<<95`
+for the accepting peer. To increment a nonce, interpret its least-significant 8
 bytes as a 64-bit unsigned integer.
 
 ### Covert Frames
