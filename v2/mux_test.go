@@ -28,7 +28,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	go func() {
 		conn, err := l.Accept()
 		if err == nil {
-			accepted, err = AcceptAnonymous(conn)
+			accepted, err = AcceptAnonymous(conn, 3)
 		}
 		errChan <- err
 	}()
@@ -37,7 +37,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	dialed, err = DialAnonymous(conn)
+	dialed, err = DialAnonymous(conn, 3)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -416,7 +416,7 @@ func TestCovertStream(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := AcceptAnonymous(conn)
+			m, err := AcceptAnonymous(conn, 3)
 			if err != nil {
 				return err
 			}
@@ -468,7 +468,7 @@ func TestCovertStream(t *testing.T) {
 	}
 	conn = &statsConn{Conn: conn} // track raw number of bytes on wire
 
-	m, err := DialAnonymous(conn)
+	m, err := DialAnonymous(conn, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,7 +713,7 @@ func BenchmarkCovertStream(b *testing.B) {
 			if err != nil {
 				return err
 			}
-			m, err := AcceptAnonymous(conn)
+			m, err := AcceptAnonymous(conn, 3)
 			if err != nil {
 				return err
 			}
@@ -754,7 +754,7 @@ func BenchmarkCovertStream(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	m, err := DialAnonymous(conn)
+	m, err := DialAnonymous(conn, 3)
 	if err != nil {
 		b.Fatal(err)
 	}

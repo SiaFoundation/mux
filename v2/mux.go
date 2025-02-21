@@ -408,12 +408,16 @@ var anonPubkey = anonPrivkey.Public().(ed25519.PublicKey)
 // DialAnonymous initiates a mux protocol handshake to a party without a
 // pre-established identity. The counterparty must reciprocate the handshake with
 // AcceptAnonymous.
-func DialAnonymous(conn net.Conn) (*Mux, error) { return Dial(conn, anonPubkey, 3) }
+func DialAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
+	return Dial(conn, anonPubkey, theirVersion)
+}
 
 // AcceptAnonymous reciprocates a mux protocol handshake without a
 // pre-established identity. The counterparty must initiate the handshake with
 // DialAnonymous.
-func AcceptAnonymous(conn net.Conn) (*Mux, error) { return Accept(conn, anonPrivkey, 3) }
+func AcceptAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
+	return Accept(conn, anonPrivkey, theirVersion)
+}
 
 // A Stream is a duplex connection multiplexed over a net.Conn. It implements
 // the net.Conn interface.
