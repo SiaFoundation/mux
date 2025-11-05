@@ -24,7 +24,7 @@ import (
 
 // Errors relating to stream or mux shutdown.
 var (
-	ErrClosedConn       = errors.New("underlying connection was closed")
+	ErrClosedConn       = errors.New("mux was closed")
 	ErrClosedStream     = errors.New("stream was gracefully closed")
 	ErrPeerClosedStream = errors.New("peer closed stream gracefully")
 	ErrPeerClosedConn   = errors.New("peer closed underlying connection")
@@ -49,7 +49,7 @@ type Mux struct {
 
 // setErr sets the Mux error and wakes up all Mux-related goroutines. If m.err
 // is already set, setErr is a no-op.
-func (m *Mux) setErr(err error) error {
+func (m *Mux) setErr(err error, context string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.err != nil {
@@ -58,7 +58,7 @@ func (m *Mux) setErr(err error) error {
 
 	// try to detect when the peer closed the connection
 	if isConnCloseError(err) {
-		err = ErrPeerClosedConn
+		err = fmt.Errorf("%w: %v", ErrPeerClosedConn, err)
 	}
 
 	// set sticky error, close conn, and wake everyone up
@@ -71,7 +71,7 @@ func (m *Mux) setErr(err error) error {
 		s.cond.L.Unlock()
 	}
 	if err != nil {
-		fmt.Println("ERROR: Closing mux due to error", err)
+		fmt.Printf("ERROR: Closing mux due to error: (context: %s) (error: %v)\n", context, err)
 	}
 	m.conn.Close()
 	m.cond.Broadcast()
@@ -201,7 +201,7 @@ func (m *Mux) writeLoop() {
 
 		// write the packet(s)
 		if _, err := m.conn.Write(packets); err != nil {
-			m.setErr(err)
+			m.setErr(err, "write packets")
 			return
 		}
 	}
@@ -223,13 +223,13 @@ func (m *Mux) readLoop() {
 	for {
 		h, payload, covert, err := pr.nextFrame(frameBuf)
 		if err != nil {
-			m.setErr(err)
+			m.setErr(err, "read nextFrame")
 			return
 		}
 		if h.id == idKeepalive {
 			continue // no action required
 		} else if h.id < idLowestStream {
-			m.setErr(fmt.Errorf("peer sent invalid frame ID (%v) (covert=%v, length=%v, flags=%v)", h.id, covert, h.length, h.flags))
+			m.setErr(fmt.Errorf("peer sent invalid frame ID (%v) (covert=%v, length=%v, flags=%v)", h.id, covert, h.length, h.flags), "invalid frame id")
 			return
 		}
 		// look for matching Stream
@@ -250,7 +250,7 @@ func (m *Mux) readLoop() {
 				const maxStreams = 1 << 20
 				if len(m.streams) > maxStreams {
 					m.mu.Unlock()
-					m.setErr(fmt.Errorf("exceeded concurrent stream limit (%v streams)", maxStreams))
+					m.setErr(fmt.Errorf("exceeded concurrent stream limit (%v streams)", maxStreams), "exceeded stream limit")
 					return
 				}
 				curStream = &Stream{
@@ -278,7 +278,7 @@ func (m *Mux) Close() error {
 		m.bufferCond.Wait()
 	}
 	m.mu.Unlock()
-	err := m.setErr(ErrClosedConn)
+	err := m.setErr(ErrClosedConn, "Close called")
 	if err == ErrClosedConn || err == ErrPeerClosedConn {
 		err = nil
 	}
