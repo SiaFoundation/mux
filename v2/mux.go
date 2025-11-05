@@ -70,6 +70,9 @@ func (m *Mux) setErr(err error) error {
 		s.cond.Broadcast()
 		s.cond.L.Unlock()
 	}
+	if err != nil {
+		fmt.Println("ERROR: Closing mux due to error", err)
+	}
 	m.conn.Close()
 	m.cond.Broadcast()
 	m.bufferCond.Broadcast()
