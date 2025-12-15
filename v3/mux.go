@@ -383,8 +383,8 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 }
 
 // Dial initiates a mux protocol handshake on the provided conn.
-func Dial(conn net.Conn, theirKey ed25519.PublicKey, theirVersion uint8) (*Mux, error) {
-	cipher, settings, err := initiateHandshake(conn, theirKey, theirVersion, defaultConnSettings)
+func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
+	cipher, settings, err := initiateHandshake(conn, theirKey, defaultConnSettings)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
@@ -392,8 +392,8 @@ func Dial(conn net.Conn, theirKey ed25519.PublicKey, theirVersion uint8) (*Mux, 
 }
 
 // Accept reciprocates a mux protocol handshake on the provided conn.
-func Accept(conn net.Conn, ourKey ed25519.PrivateKey, theirVersion uint8) (*Mux, error) {
-	cipher, settings, err := acceptHandshake(conn, ourKey, theirVersion, defaultConnSettings)
+func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
+	cipher, settings, err := acceptHandshake(conn, ourKey, defaultConnSettings)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
@@ -408,15 +408,15 @@ var anonPubkey = anonPrivkey.Public().(ed25519.PublicKey)
 // DialAnonymous initiates a mux protocol handshake to a party without a
 // pre-established identity. The counterparty must reciprocate the handshake with
 // AcceptAnonymous.
-func DialAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
-	return Dial(conn, anonPubkey, theirVersion)
+func DialAnonymous(conn net.Conn) (*Mux, error) {
+	return Dial(conn, anonPubkey)
 }
 
 // AcceptAnonymous reciprocates a mux protocol handshake without a
 // pre-established identity. The counterparty must initiate the handshake with
 // DialAnonymous.
 func AcceptAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
-	return Accept(conn, anonPrivkey, theirVersion)
+	return Accept(conn, anonPrivkey)
 }
 
 // A Stream is a duplex connection multiplexed over a net.Conn. It implements
