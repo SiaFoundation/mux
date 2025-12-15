@@ -37,7 +37,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	dialed, err = DialAnonymous(conn, 3)
+	dialed, err = DialAnonymous(conn)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestMux(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := Accept(conn, serverKey, 3)
+			m, err := Accept(conn, serverKey)
 			if err != nil {
 				return err
 			}
@@ -111,7 +111,7 @@ func TestMux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey), 3)
+	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestCovertStream(t *testing.T) {
 	}
 	conn = &statsConn{Conn: conn} // track raw number of bytes on wire
 
-	m, err := DialAnonymous(conn, 3)
+	m, err := DialAnonymous(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,67 +543,6 @@ func TestCovertStream(t *testing.T) {
 	}
 	if r != expRead {
 		t.Errorf("read %v bytes, expected %v", r, expRead)
-	}
-}
-
-func TestCompatV2(t *testing.T) {
-	serverKey := ed25519.NewKeyFromSeed(frand.Bytes(ed25519.SeedSize))
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverCh := make(chan error, 1)
-	go func() {
-		serverCh <- func() error {
-			conn, err := l.Accept()
-			if err != nil {
-				return err
-			}
-			m, err := Accept(conn, serverKey, 2)
-			if err != nil {
-				return err
-			}
-			defer m.Close()
-			s, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-			defer s.Close()
-			buf := make([]byte, 100)
-			if n, err := s.Read(buf); err != nil {
-				return err
-			} else if _, err := fmt.Fprintf(s, "hello, %s!", buf[:n]); err != nil {
-				return err
-			}
-			return s.Close()
-		}()
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey), 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	s := m.DialStream()
-	defer s.Close()
-	buf := make([]byte, 100)
-	if _, err := s.Write([]byte("world")); err != nil {
-		t.Fatal(err)
-	} else if n, err := io.ReadFull(s, buf[:13]); err != nil {
-		t.Fatal(err)
-	} else if string(buf[:n]) != "hello, world!" {
-		t.Fatal("bad hello:", string(buf[:n]))
-	}
-	if err := s.Close(); err != nil && err != ErrPeerClosedConn {
-		t.Fatal(err)
-	}
-
-	if err := <-serverCh; err != nil && err != ErrPeerClosedStream {
-		t.Fatal(err)
 	}
 }
 
@@ -754,7 +693,7 @@ func BenchmarkCovertStream(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	m, err := DialAnonymous(conn, 3)
+	m, err := DialAnonymous(conn)
 	if err != nil {
 		b.Fatal(err)
 	}

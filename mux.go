@@ -49,7 +49,7 @@ func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
 	if theirVersion[0] < 3 {
 		return nil, errors.New("versions 1 and 2 are no longer supported")
 	}
-	m, err := muxv2.Dial(conn, theirKey, theirVersion[0])
+	m, err := muxv2.Dial(conn, theirKey)
 	return &Mux{m2: m}, err
 }
 
@@ -67,7 +67,7 @@ func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
 	if theirVersion[0] < 3 {
 		return nil, errors.New("versions 1 and 2 are no longer supported")
 	}
-	m, err := muxv2.Accept(conn, ourKey, theirVersion[0])
+	m, err := muxv2.Accept(conn, ourKey)
 	return &Mux{m2: m}, err
 }
 
