@@ -101,6 +101,19 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 }
 
 func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+	// exchange versions
+	var theirVersion [1]byte
+	if _, err := conn.Write([]byte{3}); err != nil {
+		return nil, connSettings{}, fmt.Errorf("could not write our version: %w", err)
+	} else if _, err := io.ReadFull(conn, theirVersion[:]); err != nil {
+		return nil, connSettings{}, fmt.Errorf("could not read peer version: %w", err)
+	} else if theirVersion[0] == 0 {
+		return nil, connSettings{}, errors.New("peer sent invalid version")
+	}
+	if theirVersion[0] < 3 {
+		return nil, connSettings{}, errors.New("versions 1 and 2 are no longer supported")
+	}
+
 	xsk, xpk := generateX25519KeyPair()
 
 	// write pubkey
@@ -161,6 +174,19 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 }
 
 func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+	// exchange versions
+	var theirVersion [1]byte
+	if _, err := io.ReadFull(conn, theirVersion[:]); err != nil {
+		return nil, connSettings{}, fmt.Errorf("could not read peer version: %w", err)
+	} else if _, err := conn.Write([]byte{3}); err != nil {
+		return nil, connSettings{}, fmt.Errorf("could not write our version: %w", err)
+	} else if theirVersion[0] == 0 {
+		return nil, connSettings{}, errors.New("peer sent invalid version")
+	}
+	if theirVersion[0] < 3 {
+		return nil, connSettings{}, errors.New("versions 1 and 2 are no longer supported")
+	}
+
 	xsk, xpk := generateX25519KeyPair()
 
 	// read pubkey
