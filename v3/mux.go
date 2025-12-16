@@ -252,15 +252,18 @@ func (m *Mux) readLoop() {
 	}
 	frameBuf := make([]byte, m.settings.maxPayloadSize())
 
-	lastFrameCleanup := time.Now()
-	for {
-		// prune closed streams whenever enough time has passed for streams to
-		// expire
-		if time.Since(lastFrameCleanup) > closedStreamCleanupInterval {
+	// prune closed streams whenever enough time has passed for streams to
+	// expire
+	var wg sync.WaitGroup
+	cleanupTicker := time.NewTicker(closedStreamCleanupInterval)
+	defer cleanupTicker.Stop()
+	wg.Go(func() {
+		for range cleanupTicker.C {
 			m.pruneClosedStreams()
-			lastFrameCleanup = time.Now()
 		}
+	})
 
+	for {
 		h, payload, covert, err := pr.nextFrame(frameBuf)
 		if err != nil {
 			m.setErr(err)
