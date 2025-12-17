@@ -519,25 +519,18 @@ func TestCovertStream(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// amount of data transferred should be the same as without covert stream
-	expWritten := 32 + // key exchange
+	expWritten := 1 + // version
+		32 + // key exchange
 		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "world"
 
-	expRead := 32 + 64 + // key exchange
+	expRead := 1 + // version
+		32 + 64 + // key exchange
 		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "hello, world!"
 
 	w := int(atomic.LoadInt32(&conn.(*statsConn).w))
 	r := int(atomic.LoadInt32(&conn.(*statsConn).r))
-
-	// NOTE: either peer may have sent the Close packet, or both; we don't care
-	// either way
-	if w > expWritten {
-		expWritten += m.settings.PacketSize
-	}
-	if r > expRead {
-		expRead += m.settings.PacketSize
-	}
 	if w != expWritten {
 		t.Errorf("wrote %v bytes, expected %v", w, expWritten)
 	}
