@@ -546,6 +546,45 @@ func TestCovertStream(t *testing.T) {
 	}
 }
 
+func TestWriteAfterStreamClose(t *testing.T) {
+	m1, m2 := newTestingPair(t)
+
+	_ = handleStreams(m2, func(s *Stream) error {
+		defer s.Close()
+		// simple echo handler
+		buf := make([]byte, 100)
+		n, err := s.Read(buf)
+		if err != nil {
+			return err
+		} else if _, err := s.Write(buf[:n]); err != nil {
+			return err
+		}
+		t.Log("handler finished")
+		return nil
+	})
+
+	s := m1.DialStream()
+
+	if _, err := s.Write([]byte("hello, world!")); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range maxClosedFrames + 1 {
+		if _, err := fmt.Fprintf(s, "foo bar {%d}!", i); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	// a large write on a new client stream should fail. A smaller write might
+	// succeed since stream.Write doesn't guarantee that the internal buffer was
+	// flushed successfully.
+	s2 := m1.DialStream()
+	if _, err := s2.Write(frand.Bytes(1 << 20)); err == nil {
+		t.Fatal("didn't fail")
+	}
+}
+
 func BenchmarkMux(b *testing.B) {
 	for _, numStreams := range []int{1, 2, 10, 100, 500, 1000} {
 		b.Run(fmt.Sprint(numStreams), func(b *testing.B) {
