@@ -33,10 +33,10 @@ var (
 )
 
 const (
-	// closedStreamCleanupInterval is the time after which a closed stream will
-	// no longer be tracked as closed. After that time, receiving a frame for
+	// closingStreamCleanupInterval is the time after which a closed stream will
+	// no longer be tracked as closing. After that time, receiving a frame for
 	// that stream will lead to an immediate closure of the mux.
-	closedStreamCleanupInterval = 10 * time.Minute
+	closingStreamCleanupInterval = time.Minute
 
 	// maxClosedFrames is the maximum number of frames to accept for a closed
 	// stream before we consider the peer to be acting maliciously and close the
@@ -51,20 +51,22 @@ type Mux struct {
 	settings connSettings
 
 	// all subsequent fields are guarded by mu
-	mu            sync.Mutex
-	cond          sync.Cond
-	streams       map[uint32]*Stream
-	closedStreams map[uint32]closedStream
-	nextID        uint32
-	err           error // sticky and fatal
-	writeBuf      []byte
-	covertBuf     []byte
-	bufferCond    sync.Cond // separate cond for waking a single bufferFrame
+	mu             sync.Mutex
+	cond           sync.Cond
+	streams        map[uint32]*Stream
+	closingStreams map[uint32]closingStream // streams closed by us
+	nextID         uint32
+	err            error // sticky and fatal
+	writeBuf       []byte
+	covertBuf      []byte
+	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
-// closedStream is used to track streams that have been closed either by us or
-// the peer.
-type closedStream struct {
+// closingStream is used to track streams that have been closed by us until either
+// - the peer acknowledges the closure by sending a frame with flagLast
+// - frameCount exceeds maxClosedFrames
+// - closingStreamCleanupInterval has passed
+type closingStream struct {
 	frameCount uint16
 	closed     time.Time
 }
@@ -229,13 +231,13 @@ func (m *Mux) writeLoop() {
 func (m *Mux) pruneClosedStreams() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id, cs := range m.closedStreams {
-		if time.Since(cs.closed) > closedStreamCleanupInterval {
-			delete(m.closedStreams, id)
+	for id, cs := range m.closingStreams {
+		if time.Since(cs.closed) > closingStreamCleanupInterval {
+			delete(m.closingStreams, id)
 		}
 	}
-	if len(m.closedStreams) == 0 {
-		m.closedStreams = make(map[uint32]closedStream) // free memory
+	if len(m.closingStreams) == 0 {
+		m.closingStreams = make(map[uint32]closingStream) // free memory
 	}
 }
 
@@ -255,7 +257,8 @@ func (m *Mux) readLoop() {
 	// prune closed streams whenever enough time has passed for streams to
 	// expire
 	var wg sync.WaitGroup
-	cleanupTicker := time.NewTicker(closedStreamCleanupInterval)
+	defer wg.Wait()
+	cleanupTicker := time.NewTicker(closingStreamCleanupInterval)
 	defer cleanupTicker.Stop()
 	wg.Go(func() {
 		for range cleanupTicker.C {
@@ -283,7 +286,7 @@ func (m *Mux) readLoop() {
 			stream = s
 		} else {
 			if h.flags&flagFirst == 0 {
-				cs, ok := m.closedStreams[h.id]
+				cs, ok := m.closingStreams[h.id]
 				if ok {
 					// we are encountering a frame for a stream that has already
 					// been closed. This could be a delayed frame, or it could be an
@@ -291,7 +294,7 @@ func (m *Mux) readLoop() {
 					// we've seen for this closed stream, and if it exceeds the threshold,
 					// close the mux
 					cs.frameCount++
-					m.closedStreams[h.id] = cs
+					m.closingStreams[h.id] = cs
 					if cs.frameCount >= maxClosedFrames {
 						m.mu.Unlock()
 						m.setErr(ErrStreamFlood)
@@ -428,14 +431,14 @@ func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
 // newMux initializes a Mux and spawns its readLoop and writeLoop goroutines.
 func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 	m := &Mux{
-		conn:          conn,
-		cipher:        cipher,
-		closedStreams: make(map[uint32]closedStream),
-		settings:      settings,
-		streams:       make(map[uint32]*Stream),
-		nextID:        idLowestStream,
-		writeBuf:      make([]byte, 0, settings.maxFrameSize()*10),
-		covertBuf:     make([]byte, 0, settings.maxPayloadSize()*2),
+		conn:           conn,
+		cipher:         cipher,
+		closingStreams: make(map[uint32]closingStream),
+		settings:       settings,
+		streams:        make(map[uint32]*Stream),
+		nextID:         idLowestStream,
+		writeBuf:       make([]byte, 0, settings.maxFrameSize()*10),
+		covertBuf:      make([]byte, 0, settings.maxPayloadSize()*2),
 	}
 	// both conds use the same mutex
 	m.cond.L = &m.mu
@@ -555,9 +558,7 @@ func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
 		// delete stream from Mux
 		s.m.mu.Lock()
 		delete(s.m.streams, s.id)
-		s.m.closedStreams[s.id] = closedStream{
-			closed: time.Now(),
-		}
+		delete(s.m.closingStreams, s.id) // in case we had already closed it on our end
 		s.m.mu.Unlock()
 		return
 	}
@@ -667,7 +668,7 @@ func (s *Stream) Close() error {
 	// delete stream from Mux
 	s.m.mu.Lock()
 	delete(s.m.streams, s.id)
-	s.m.closedStreams[s.id] = closedStream{
+	s.m.closingStreams[s.id] = closingStream{
 		closed: time.Now(),
 	}
 	s.m.mu.Unlock()
