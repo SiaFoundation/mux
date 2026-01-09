@@ -302,34 +302,6 @@ func TestContext(t *testing.T) {
 		t.SkipNow()
 	}
 
-	m1, m2 := newTestingPair(t)
-
-	serverCh := handleStreams(m2, func(s *Stream) error {
-		// wait 250ms before reading
-		time.Sleep(250 * time.Millisecond)
-		var n uint64
-		if err := binary.Read(s, binary.LittleEndian, &n); err != nil {
-			return err
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(s, buf); err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
-			}
-			return err
-		}
-
-		// wait 250ms before replying
-		time.Sleep(250 * time.Millisecond)
-		echo := make([]byte, len(buf)+8)
-		binary.LittleEndian.PutUint64(echo, n)
-		copy(echo[8:], buf)
-		if _, err := s.Write(echo); err != nil {
-			return err
-		}
-		return nil
-	})
-
 	tests := []struct {
 		err     error
 		context func() context.Context
@@ -357,6 +329,34 @@ func TestContext(t *testing.T) {
 	}
 	for i, test := range tests {
 		err := func() error {
+			m1, m2 := newTestingPair(t)
+
+			serverCh := handleStreams(m2, func(s *Stream) error {
+				// wait 250ms before reading
+				time.Sleep(250 * time.Millisecond)
+				var n uint64
+				if err := binary.Read(s, binary.LittleEndian, &n); err != nil {
+					return err
+				}
+				buf := make([]byte, n)
+				if _, err := io.ReadFull(s, buf); err != nil {
+					if errors.Is(err, io.ErrUnexpectedEOF) {
+						return nil
+					}
+					return err
+				}
+
+				// wait 250ms before replying
+				time.Sleep(250 * time.Millisecond)
+				echo := make([]byte, len(buf)+8)
+				binary.LittleEndian.PutUint64(echo, n)
+				copy(echo[8:], buf)
+				if _, err := s.Write(echo); err != nil {
+					return err
+				}
+				return nil
+			})
+
 			s := m1.DialStreamContext(test.context())
 			defer s.Close()
 
@@ -373,17 +373,21 @@ func TestContext(t *testing.T) {
 			} else if !bytes.Equal(msg, resp) {
 				return errors.New("bad echo")
 			}
-			return s.Close()
+
+			if err := s.Close(); err != nil {
+				return err
+			}
+
+			if err := m1.Close(); err != nil {
+				t.Fatal(err)
+			} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn && err != ErrPeerClosedStream {
+				t.Fatal(err)
+			}
+			return nil
 		}()
 		if !errors.Is(err, test.err) {
 			t.Fatalf("test %v: expected error %v, got %v", i, test.err, err)
 		}
-	}
-
-	if err := m1.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn && err != ErrPeerClosedStream {
-		t.Fatal(err)
 	}
 }
 
@@ -519,25 +523,18 @@ func TestCovertStream(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// amount of data transferred should be the same as without covert stream
-	expWritten := 32 + // key exchange
+	expWritten := 1 + // version
+		32 + // key exchange
 		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "world"
 
-	expRead := 32 + 64 + // key exchange
+	expRead := 1 + // version
+		32 + 64 + // key exchange
 		connSettingsSize + chachaPoly1305TagSize + // settings
 		m.settings.PacketSize // "hello, world!"
 
 	w := int(atomic.LoadInt32(&conn.(*statsConn).w))
 	r := int(atomic.LoadInt32(&conn.(*statsConn).r))
-
-	// NOTE: either peer may have sent the Close packet, or both; we don't care
-	// either way
-	if w > expWritten {
-		expWritten += m.settings.PacketSize
-	}
-	if r > expRead {
-		expRead += m.settings.PacketSize
-	}
 	if w != expWritten {
 		t.Errorf("wrote %v bytes, expected %v", w, expWritten)
 	}
