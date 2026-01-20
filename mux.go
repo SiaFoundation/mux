@@ -56,9 +56,9 @@ type Mux struct {
 	streams        map[uint32]*Stream
 	closingStreams map[uint32]closingStream // streams closed by us
 	nextID         uint32
-	err        error // sticky and fatal
-	writeBuf   []byte
-	bufferCond sync.Cond // separate cond for waking a single bufferFrame
+	err            error // sticky and fatal
+	writeBuf       []byte
+	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
 // closingStream is used to track streams that have been closed by us until either
