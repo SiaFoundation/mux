@@ -272,11 +272,18 @@ func (m *Mux) readLoop() {
 	// expire
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	done := make(chan struct{})
+	defer close(done)
 	cleanupTicker := time.NewTicker(closingStreamCleanupInterval)
 	defer cleanupTicker.Stop()
 	wg.Go(func() {
-		for range cleanupTicker.C {
-			m.pruneClosedStreams()
+		for {
+			select {
+			case <-done:
+				return
+			case <-cleanupTicker.C:
+				m.pruneClosedStreams()
+			}
 		}
 	})
 
