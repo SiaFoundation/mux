@@ -59,7 +59,6 @@ type packetReader struct {
 	buf       []byte
 	encrypted []byte // aliases buf
 	decrypted []byte // aliases buf
-	covert    []byte // separate buffer; grows until we have a full frame
 }
 
 func (pr *packetReader) Read(p []byte) (int, error) {
@@ -95,49 +94,22 @@ func (pr *packetReader) skipPadding() {
 	if len(pr.decrypted) == 0 || pr.decrypted[0]&1 != 0 {
 		return
 	}
-	// the second bit tells us if we have covert data or padding
-	if pr.decrypted[0]&0b10 != 0 {
-		pr.covert = append(pr.covert, pr.decrypted[1:]...)
-	}
 	pr.decrypted = pr.decrypted[len(pr.decrypted):]
 }
 
-func (pr *packetReader) covertFrame() (frameHeader, []byte, bool) {
-	if len(pr.covert) < frameHeaderSize {
-		return frameHeader{}, nil, false
-	}
-	h := decodeFrameHeader(pr.covert[:frameHeaderSize])
-	if len(pr.covert[frameHeaderSize:]) < int(h.length) {
-		return frameHeader{}, nil, false
-	}
-	payload := pr.covert[frameHeaderSize:][:h.length]
-	// check for another covert frame
-	if rest := pr.covert[frameHeaderSize+h.length:]; len(rest) > 0 && rest[0]&1 != 0 {
-		pr.covert = rest
-	} else {
-		// no more covert data; skip rest of buffer
-		pr.covert = pr.covert[:0]
-	}
-	return h, payload, true
-}
-
-func (pr *packetReader) nextFrame(buf []byte) (frameHeader, []byte, bool, error) {
+func (pr *packetReader) nextFrame(buf []byte) (frameHeader, []byte, error) {
 	pr.skipPadding()
-	// if we've buffered a full covert frame, return it
-	if h, payload, ok := pr.covertFrame(); ok {
-		return h, payload, true, nil
-	}
 
 	if _, err := io.ReadFull(pr, buf[:frameHeaderSize]); err != nil {
-		return frameHeader{}, nil, false, fmt.Errorf("could not read frame header: %w", err)
+		return frameHeader{}, nil, fmt.Errorf("could not read frame header: %w", err)
 	}
 	h := decodeFrameHeader(buf[:frameHeaderSize])
 	if h.length > uint16(pr.packetSize-frameHeaderSize) {
-		return frameHeader{}, nil, false, fmt.Errorf("peer sent too-large frame (%v bytes)", h.length)
+		return frameHeader{}, nil, fmt.Errorf("peer sent too-large frame (%v bytes)", h.length)
 	} else if _, err := io.ReadFull(pr, buf[:h.length]); err != nil {
-		return frameHeader{}, nil, false, fmt.Errorf("could not read frame payload: %w", err)
+		return frameHeader{}, nil, fmt.Errorf("could not read frame payload: %w", err)
 	}
-	return h, buf[:h.length], false, nil
+	return h, buf[:h.length], nil
 }
 
 func encryptPackets(buf []byte, p []byte, packetSize int, cipher *seqCipher) []byte {
