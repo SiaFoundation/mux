@@ -19,8 +19,8 @@ const (
 )
 
 const (
-	chachaPoly1305NonceSize = 12
-	chachaPoly1305TagSize   = 16
+	aeadNonceSize = 12
+	aeadTagSize   = 16
 )
 
 type frameHeader struct {
@@ -141,9 +141,9 @@ func (pr *packetReader) nextFrame(buf []byte) (frameHeader, []byte, bool, error)
 }
 
 func encryptPackets(buf []byte, p []byte, packetSize int, cipher *seqCipher) []byte {
-	maxFrameSize := packetSize - chachaPoly1305TagSize
+	maxFrameSize := packetSize - aeadTagSize
 	numPackets := len(p) / maxFrameSize
-	for i := 0; i < numPackets; i++ {
+	for i := range numPackets {
 		packet := buf[i*packetSize:][:packetSize]
 		plaintext := p[i*maxFrameSize:][:maxFrameSize]
 		copy(packet, plaintext)

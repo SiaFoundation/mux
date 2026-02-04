@@ -20,6 +20,10 @@ import (
 )
 
 func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
+	return newTestingPairWithVersion(tb, 4)
+}
+
+func newTestingPairWithVersion(tb testing.TB, peerVersion uint8) (dialed, accepted *Mux) {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		tb.Fatal(err)
@@ -28,7 +32,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	go func() {
 		conn, err := l.Accept()
 		if err == nil {
-			accepted, err = AcceptAnonymous(conn, 3)
+			accepted, err = AcceptAnonymous(conn, peerVersion)
 		}
 		errChan <- err
 	}()
@@ -37,7 +41,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	dialed, err = DialAnonymous(conn)
+	dialed, err = DialAnonymous(conn, peerVersion)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -74,6 +78,39 @@ func handleStreams(m *Mux, fn func(*Stream) error) chan error {
 	return errChan
 }
 
+func TestVersionSelection(t *testing.T) {
+	for _, version := range []uint8{3, 4, 5, 255} {
+		t.Run(fmt.Sprintf("version_%d", version), func(t *testing.T) {
+			m1, m2 := newTestingPairWithVersion(t, version)
+
+			serverCh := handleStreams(m2, func(s *Stream) error {
+				buf := make([]byte, 100)
+				n, _ := s.Read(buf)
+				s.Write(buf[:n])
+				return nil
+			})
+
+			s := m1.DialStream()
+			msg := "hello, world!"
+			buf := make([]byte, len(msg))
+			if _, err := s.Write([]byte(msg)); err != nil {
+				t.Fatal(err)
+			} else if _, err := io.ReadFull(s, buf); err != nil {
+				t.Fatal(err)
+			} else if string(buf) != msg {
+				t.Fatalf("bad echo: got %q, want %q", string(buf), msg)
+			}
+			s.Close()
+
+			if err := m1.Close(); err != nil {
+				t.Fatal(err)
+			} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestMux(t *testing.T) {
 	serverKey := ed25519.NewKeyFromSeed(frand.Bytes(ed25519.SeedSize))
 	l, err := net.Listen("tcp", ":0")
@@ -87,7 +124,7 @@ func TestMux(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := Accept(conn, serverKey)
+			m, err := Accept(conn, serverKey, 4)
 			if err != nil {
 				return err
 			}
@@ -111,7 +148,7 @@ func TestMux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey))
+	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +453,7 @@ func TestCovertStream(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := AcceptAnonymous(conn, 3)
+			m, err := AcceptAnonymous(conn, 4)
 			if err != nil {
 				return err
 			}
@@ -468,7 +505,7 @@ func TestCovertStream(t *testing.T) {
 	}
 	conn = &statsConn{Conn: conn} // track raw number of bytes on wire
 
-	m, err := DialAnonymous(conn)
+	m, err := DialAnonymous(conn, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,11 +557,11 @@ func TestCovertStream(t *testing.T) {
 
 	// amount of data transferred should be the same as without covert stream
 	expWritten := 32 + // key exchange
-		connSettingsSize + chachaPoly1305TagSize + // settings
+		connSettingsSize + aeadTagSize + // settings
 		m.settings.PacketSize // "world"
 
 	expRead := 32 + 64 + // key exchange
-		connSettingsSize + chachaPoly1305TagSize + // settings
+		connSettingsSize + aeadTagSize + // settings
 		m.settings.PacketSize // "hello, world!"
 
 	w := int(atomic.LoadInt32(&conn.(*statsConn).w))
@@ -691,7 +728,7 @@ func BenchmarkCovertStream(b *testing.B) {
 			if err != nil {
 				return err
 			}
-			m, err := AcceptAnonymous(conn, 3)
+			m, err := AcceptAnonymous(conn, 4)
 			if err != nil {
 				return err
 			}
@@ -732,7 +769,7 @@ func BenchmarkCovertStream(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	m, err := DialAnonymous(conn)
+	m, err := DialAnonymous(conn, 4)
 	if err != nil {
 		b.Fatal(err)
 	}
