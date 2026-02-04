@@ -2,7 +2,6 @@ package mux
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -365,30 +364,6 @@ func (m *Mux) DialStream() *Stream {
 		// at compile time using the following declaration:
 		var _ [idLowestStream & 1]struct{} = [0]struct{}{}
 	}
-	return s
-}
-
-// DialStreamContext creates a new Stream with the provided context. When the
-// context expires, the Stream will be closed and any pending calls will return
-// ctx.Err(). DialStreamContext spawns a goroutine whose lifetime matches that
-// of the context.
-//
-// Unlike e.g. net.Dial, this does not perform any I/O; the peer will not be
-// aware of the new Stream until Write is called.
-//
-// Deprecated: To associate a Stream with a context, use a helper function as
-// described here: https://github.com/SiaFoundation/mux/pull/2#issuecomment-2351171318
-func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
-	s := m.DialStream()
-	go func() {
-		<-ctx.Done()
-		s.cond.L.Lock()
-		defer s.cond.L.Unlock()
-		if ctx.Err() != nil && s.err == nil {
-			s.err = ctx.Err()
-			s.cond.Broadcast()
-		}
-	}()
 	return s
 }
 

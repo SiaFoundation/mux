@@ -1,10 +1,7 @@
 package mux
 
 import (
-	"bytes"
-	"context"
 	"crypto/ed25519"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -322,96 +319,6 @@ func TestDeadline(t *testing.T) {
 		}()
 		if isTimeout := errors.Is(err, os.ErrDeadlineExceeded); test.timeout != isTimeout {
 			t.Errorf("test %v: expected timeout=%v, got %v", i, test.timeout, err)
-		}
-	}
-
-	if err := m1.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn && err != ErrPeerClosedStream {
-		t.Fatal(err)
-	}
-}
-
-func TestContext(t *testing.T) {
-	if testing.Short() {
-		t.SkipNow()
-	}
-
-	m1, m2 := newTestingPair(t)
-
-	serverCh := handleStreams(m2, func(s *Stream) error {
-		// wait 250ms before reading
-		time.Sleep(250 * time.Millisecond)
-		var n uint64
-		if err := binary.Read(s, binary.LittleEndian, &n); err != nil {
-			return err
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(s, buf); err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
-			}
-			return err
-		}
-
-		// wait 250ms before replying
-		time.Sleep(250 * time.Millisecond)
-		echo := make([]byte, len(buf)+8)
-		binary.LittleEndian.PutUint64(echo, n)
-		copy(echo[8:], buf)
-		if _, err := s.Write(echo); err != nil {
-			return err
-		}
-		return nil
-	})
-
-	tests := []struct {
-		err     error
-		context func() context.Context
-	}{
-		{nil, func() context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-			t.Cleanup(cancel)
-			return ctx
-		}},
-		{context.Canceled, func() context.Context {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			return ctx
-		}},
-		{context.Canceled, func() context.Context {
-			ctx, cancel := context.WithCancel(context.Background())
-			time.AfterFunc(time.Millisecond*5, cancel)
-			return ctx
-		}},
-		{context.DeadlineExceeded, func() context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*5)
-			t.Cleanup(cancel)
-			return ctx
-		}},
-	}
-	for i, test := range tests {
-		err := func() error {
-			s := m1.DialStreamContext(test.context())
-			defer s.Close()
-
-			msg := make([]byte, m1.settings.PacketSize*10+8)
-			frand.Read(msg[8 : 128+8])
-			binary.LittleEndian.PutUint64(msg, uint64(len(msg)-8))
-			if _, err := s.Write(msg); err != nil {
-				return fmt.Errorf("write: %w", err)
-			}
-
-			resp := make([]byte, len(msg))
-			if _, err := io.ReadFull(s, resp); err != nil {
-				return fmt.Errorf("read: %w", err)
-			} else if !bytes.Equal(msg, resp) {
-				return errors.New("bad echo")
-			}
-			return s.Close()
-		}()
-		if !errors.Is(err, test.err) {
-			t.Fatalf("test %v: expected error %v, got %v", i, test.err, err)
 		}
 	}
 
