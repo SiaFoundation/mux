@@ -12,11 +12,8 @@ with other multiplexers available at the time.
 As a privacy-focused multiplexer, SiaMux behaves differently from other muxes.
 It transparently encrypts the connection, and supports authentication via
 Ed25519 public keys. To hinder metadata analysis, it always writes data in
-fixed-size "packets," inserting padding as necessary. Lastly, SiaMux implements
-a unique feature known as *covert streams*. Covert streams hide their data
-within the padding of other streams, making them completely undetectable to
-network analysis (at the cost of greatly reduced throughput). SiaMux can be used
-for any application in need of a multiplexer, but its privacy features make it a
+fixed-size "packets," inserting padding as necessary. SiaMux can be used for any
+application in need of a multiplexer, but its privacy features make it a
 particularly good choice for p2p networks and other distributed systems.
 
 ## Usage
@@ -47,9 +44,6 @@ io.Copy(os.Stdout, s)
 For authenticated communication, use `mux.Dial`/`mux.Accept` with a
 `crypto/ed25519` keypair.
 
-To create a covert stream, use `m.DialCovertStream`. The accepting peer calls
-`m.AcceptStream` as usual.
-
 ## Benchmarks
 
 SiaMux allocates very little memory (some buffers at startup, plus the `Stream`
@@ -60,11 +54,10 @@ alternatives such as [yamux](github.com/hashicorp/yamux),
 [smux](https://github.com/xtaci/smux).
 
 ```
-BenchmarkMux/1            5156 ns/op     830.90 MB/s      193977 frames/sec        0 allocs/op
-BenchmarkMux/2            9550 ns/op     897.21 MB/s      210562 frames/sec        0 allocs/op
-BenchmarkMux/10          50567 ns/op     847.19 MB/s      198281 frames/sec        0 allocs/op
-BenchmarkMux/100        449494 ns/op     953.07 MB/s      223966 frames/sec        0 allocs/op
-BenchmarkMux/500       2184647 ns/op     980.48 MB/s      229271 frames/sec        7 allocs/op
-BenchmarkMux/1000      4548476 ns/op     941.85 MB/s      221448 frames/sec       28 allocs/op
-BenchmarkCovertStream    45805 ns/op      93.53 MB/s       21833 frames/sec        2 allocs/op
+BenchmarkMux/1           1221 ns/op     3517.96 MB/s      818917 frames/sec        0 allocs/op
+BenchmarkMux/2           2643 ns/op     3251.42 MB/s      756858 frames/sec        0 allocs/op
+BenchmarkMux/10         15646 ns/op     2745.76 MB/s      639151 frames/sec        0 allocs/op
+BenchmarkMux/100       195125 ns/op     2201.66 MB/s      512501 frames/sec        0 allocs/op
+BenchmarkMux/500       941216 ns/op     2282.16 MB/s      531237 frames/sec        2 allocs/op
+BenchmarkMux/1000     1884418 ns/op     2279.75 MB/s      530677 frames/sec       11 allocs/op
 ```

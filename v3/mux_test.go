@@ -1,25 +1,24 @@
 package mux
 
 import (
-	"bytes"
-	"context"
 	"crypto/ed25519"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/chacha20poly1305"
 	"lukechampine.com/frand"
 )
 
 func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
+	return newTestingPairWithVersion(tb, 4)
+}
+
+func newTestingPairWithVersion(tb testing.TB, peerVersion uint8) (dialed, accepted *Mux) {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		tb.Fatal(err)
@@ -28,7 +27,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	go func() {
 		conn, err := l.Accept()
 		if err == nil {
-			accepted, err = AcceptAnonymous(conn, 3)
+			accepted, err = AcceptAnonymous(conn, peerVersion)
 		}
 		errChan <- err
 	}()
@@ -37,7 +36,7 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	dialed, err = DialAnonymous(conn)
+	dialed, err = DialAnonymous(conn, peerVersion)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -74,6 +73,39 @@ func handleStreams(m *Mux, fn func(*Stream) error) chan error {
 	return errChan
 }
 
+func TestVersionSelection(t *testing.T) {
+	for _, version := range []uint8{3, 4, 5, 255} {
+		t.Run(fmt.Sprintf("version_%d", version), func(t *testing.T) {
+			m1, m2 := newTestingPairWithVersion(t, version)
+
+			serverCh := handleStreams(m2, func(s *Stream) error {
+				buf := make([]byte, 100)
+				n, _ := s.Read(buf)
+				s.Write(buf[:n])
+				return nil
+			})
+
+			s := m1.DialStream()
+			msg := "hello, world!"
+			buf := make([]byte, len(msg))
+			if _, err := s.Write([]byte(msg)); err != nil {
+				t.Fatal(err)
+			} else if _, err := io.ReadFull(s, buf); err != nil {
+				t.Fatal(err)
+			} else if string(buf) != msg {
+				t.Fatalf("bad echo: got %q, want %q", string(buf), msg)
+			}
+			s.Close()
+
+			if err := m1.Close(); err != nil {
+				t.Fatal(err)
+			} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestMux(t *testing.T) {
 	serverKey := ed25519.NewKeyFromSeed(frand.Bytes(ed25519.SeedSize))
 	l, err := net.Listen("tcp", ":0")
@@ -87,7 +119,7 @@ func TestMux(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			m, err := Accept(conn, serverKey)
+			m, err := Accept(conn, serverKey, 4)
 			if err != nil {
 				return err
 			}
@@ -111,7 +143,7 @@ func TestMux(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey))
+	m, err := Dial(conn, serverKey.Public().(ed25519.PublicKey), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,255 +329,6 @@ func TestDeadline(t *testing.T) {
 	}
 }
 
-func TestContext(t *testing.T) {
-	if testing.Short() {
-		t.SkipNow()
-	}
-
-	m1, m2 := newTestingPair(t)
-
-	serverCh := handleStreams(m2, func(s *Stream) error {
-		// wait 250ms before reading
-		time.Sleep(250 * time.Millisecond)
-		var n uint64
-		if err := binary.Read(s, binary.LittleEndian, &n); err != nil {
-			return err
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(s, buf); err != nil {
-			if errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
-			}
-			return err
-		}
-
-		// wait 250ms before replying
-		time.Sleep(250 * time.Millisecond)
-		echo := make([]byte, len(buf)+8)
-		binary.LittleEndian.PutUint64(echo, n)
-		copy(echo[8:], buf)
-		if _, err := s.Write(echo); err != nil {
-			return err
-		}
-		return nil
-	})
-
-	tests := []struct {
-		err     error
-		context func() context.Context
-	}{
-		{nil, func() context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-			t.Cleanup(cancel)
-			return ctx
-		}},
-		{context.Canceled, func() context.Context {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			return ctx
-		}},
-		{context.Canceled, func() context.Context {
-			ctx, cancel := context.WithCancel(context.Background())
-			time.AfterFunc(time.Millisecond*5, cancel)
-			return ctx
-		}},
-		{context.DeadlineExceeded, func() context.Context {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*5)
-			t.Cleanup(cancel)
-			return ctx
-		}},
-	}
-	for i, test := range tests {
-		err := func() error {
-			s := m1.DialStreamContext(test.context())
-			defer s.Close()
-
-			msg := make([]byte, m1.settings.PacketSize*10+8)
-			frand.Read(msg[8 : 128+8])
-			binary.LittleEndian.PutUint64(msg, uint64(len(msg)-8))
-			if _, err := s.Write(msg); err != nil {
-				return fmt.Errorf("write: %w", err)
-			}
-
-			resp := make([]byte, len(msg))
-			if _, err := io.ReadFull(s, resp); err != nil {
-				return fmt.Errorf("read: %w", err)
-			} else if !bytes.Equal(msg, resp) {
-				return errors.New("bad echo")
-			}
-			return s.Close()
-		}()
-		if !errors.Is(err, test.err) {
-			t.Fatalf("test %v: expected error %v, got %v", i, test.err, err)
-		}
-	}
-
-	if err := m1.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn && err != ErrPeerClosedStream {
-		t.Fatal(err)
-	}
-}
-
-type statsConn struct {
-	r, w int32
-	net.Conn
-}
-
-func (c *statsConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	atomic.AddInt32(&c.r, int32(n))
-	return n, err
-}
-
-func (c *statsConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	atomic.AddInt32(&c.w, int32(n))
-	return n, err
-}
-
-func TestCovertStream(t *testing.T) {
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverCh := make(chan error, 1)
-	go func() {
-		serverCh <- func() error {
-			conn, err := l.Accept()
-			if err != nil {
-				return err
-			}
-			m, err := AcceptAnonymous(conn, 3)
-			if err != nil {
-				return err
-			}
-			defer m.Close()
-			// accept covert stream
-			cs, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-			covertCh := make(chan error)
-			go func() {
-				defer cs.Close()
-				buf := make([]byte, 100)
-				if n, err := cs.Read(buf); err != nil {
-					covertCh <- err
-				} else if _, err := fmt.Fprintf(cs, "hello, %s!", buf[:n]); err != nil {
-					covertCh <- err
-				} else {
-					covertCh <- cs.Close()
-				}
-			}()
-			// accept regular stream
-			s, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-			defer s.Close()
-			buf := make([]byte, 100)
-			n, err := s.Read(buf)
-			if err != nil {
-				return err
-			}
-			// wait for covert stream to buffer before writing
-			if err := <-covertCh; err != nil {
-				return err
-			}
-			if _, err := fmt.Fprintf(s, "hello, %s!", buf[:n]); err != nil {
-				return err
-			} else if err := s.Close(); err != nil {
-				return err
-			}
-			return m.Close()
-		}()
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn = &statsConn{Conn: conn} // track raw number of bytes on wire
-
-	m, err := DialAnonymous(conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-
-	covertCh := make(chan error, 1)
-	bufChan := make(chan struct{})
-	go func() {
-		s := m.DialCovertStream()
-		defer s.Close()
-		buf := make([]byte, 100)
-		if _, err := s.Write([]byte("covert")); err != nil {
-			covertCh <- err
-			return
-		}
-		bufChan <- struct{}{}
-		if n, err := io.ReadFull(s, buf[:14]); err != nil {
-			covertCh <- err
-		} else if string(buf[:n]) != "hello, covert!" {
-			covertCh <- fmt.Errorf("bad hello: %s %x", buf[:n], buf[:n])
-		} else {
-			covertCh <- s.Close()
-		}
-	}()
-
-	// to generate padding for covert stream, send a regular packet
-	s := m.DialStream()
-	<-bufChan // wait for covert stream to buffer
-	buf := make([]byte, 100)
-	if _, err := s.Write([]byte("world")); err != nil {
-		t.Log(<-serverCh)
-		t.Fatal(err)
-	} else if n, err := io.ReadFull(s, buf[:13]); err != nil {
-		t.Log(<-serverCh)
-		t.Fatal(err)
-	} else if string(buf[:n]) != "hello, world!" {
-		t.Fatalf("bad hello: %s", buf[:n])
-	}
-
-	if err := <-covertCh; err != nil && err != ErrPeerClosedConn {
-		t.Fatal(err)
-	} else if err := m.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedStream {
-		t.Fatal(err)
-	}
-	// wait for read/write goroutines to exit
-	time.Sleep(time.Second)
-
-	// amount of data transferred should be the same as without covert stream
-	expWritten := 32 + // key exchange
-		connSettingsSize + chachaPoly1305TagSize + // settings
-		m.settings.PacketSize // "world"
-
-	expRead := 32 + 64 + // key exchange
-		connSettingsSize + chachaPoly1305TagSize + // settings
-		m.settings.PacketSize // "hello, world!"
-
-	w := int(atomic.LoadInt32(&conn.(*statsConn).w))
-	r := int(atomic.LoadInt32(&conn.(*statsConn).r))
-
-	// NOTE: either peer may have sent the Close packet, or both; we don't care
-	// either way
-	if w > expWritten {
-		expWritten += m.settings.PacketSize
-	}
-	if r > expRead {
-		expRead += m.settings.PacketSize
-	}
-	if w != expWritten {
-		t.Errorf("wrote %v bytes, expected %v", w, expWritten)
-	}
-	if r != expRead {
-		t.Errorf("read %v bytes, expected %v", r, expRead)
-	}
-}
-
 func TestWriteAfterStreamClose(t *testing.T) {
 	m1, m2 := newTestingPair(t)
 
@@ -621,154 +404,6 @@ func BenchmarkMux(b *testing.B) {
 			b.ReportMetric(float64(b.N*numStreams)/time.Since(start).Seconds(), "frames/sec")
 		})
 	}
-}
-
-func BenchmarkConn(b *testing.B) {
-	// benchmark throughput of raw TCP conn (plus encryption overhead to make it fair)
-	encryptionKey := make([]byte, 32)
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		b.Fatal(err)
-	}
-	serverCh := make(chan error, 1)
-	go func() {
-		serverCh <- func() error {
-			conn, err := l.Accept()
-			if err != nil {
-				return err
-			}
-			defer conn.Close()
-			aead, _ := chacha20poly1305.New(encryptionKey)
-			cipher := &seqCipher{aead: aead}
-			buf := make([]byte, defaultConnSettings.PacketSize)
-			for {
-				_, err := io.ReadFull(conn, buf)
-				if err != nil {
-					return err
-				}
-				if _, err := cipher.decryptInPlace(buf); err != nil {
-					return err
-				}
-			}
-		}()
-	}()
-	defer func() {
-		if err := <-serverCh; err != nil && err != io.EOF {
-			b.Fatal(err)
-		}
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer conn.Close()
-
-	aead, _ := chacha20poly1305.New(encryptionKey)
-	cipher := &seqCipher{aead: aead}
-	buf := make([]byte, defaultConnSettings.PacketSize*10)
-	b.ResetTimer()
-	b.SetBytes(int64(defaultConnSettings.maxPayloadSize()))
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		cipher.encryptInPlace(buf)
-		if _, err := conn.Write(buf); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkCovertStream(b *testing.B) {
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer l.Close()
-	serverCh := make(chan error, 1)
-	go func() {
-		serverCh <- func() error {
-			conn, err := l.Accept()
-			if err != nil {
-				return err
-			}
-			m, err := AcceptAnonymous(conn, 3)
-			if err != nil {
-				return err
-			}
-
-			// background stream, to provide padding for covert streams
-			bs, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-			defer bs.Close()
-			go io.Copy(bs, bs)
-
-			cs, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-
-			for n := 0; n < b.N*defaultConnSettings.maxPayloadSize(); {
-				buf := make([]byte, defaultConnSettings.maxPayloadSize())
-				r, err := cs.Read(buf)
-				if err != nil {
-					return err
-				}
-				n += r
-			}
-			cs.Write([]byte{1})
-			cs.Close()
-			return m.Close()
-		}()
-	}()
-	defer func() {
-		if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
-			b.Fatal(err)
-		}
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		b.Fatal(err)
-	}
-	m, err := DialAnonymous(conn)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer m.Close()
-
-	// background stream, to provide padding for covert streams
-	backBuf := make([]byte, 100)
-	for i := range backBuf {
-		backBuf[i] = 0x77
-	}
-	bs := m.DialStream()
-	defer bs.Close()
-	if _, err := bs.Write(backBuf); err != nil {
-		b.Fatal(err)
-	}
-	go io.Copy(bs, bs)
-
-	// open each stream in a separate goroutine
-	bufSize := defaultConnSettings.maxPayloadSize()
-	buf := make([]byte, bufSize)
-	for i := range buf {
-		buf[i] = 0xFF
-	}
-	b.ResetTimer()
-	b.SetBytes(int64(bufSize))
-	b.ReportAllocs()
-	start := time.Now()
-	cs := m.DialCovertStream()
-	defer cs.Close()
-	for i := 0; i < b.N; i++ {
-		if _, err := cs.Write(buf); err != nil {
-			b.Fatal(err)
-		}
-	}
-	cs.Read(buf[:1]) // ensure that server received all frames
-	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "frames/sec")
 }
 
 func BenchmarkPackets(b *testing.B) {

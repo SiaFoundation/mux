@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ed25519"
 	"encoding/binary"
@@ -24,8 +25,19 @@ func generateX25519KeyPair() (xsk, xpk [32]byte) {
 
 type seqCipher struct {
 	aead       cipher.AEAD
-	ourNonce   [chachaPoly1305NonceSize]byte
-	theirNonce [chachaPoly1305NonceSize]byte
+	ourNonce   [aeadNonceSize]byte
+	theirNonce [aeadNonceSize]byte
+}
+
+func newAEAD(key []byte, peerVersion uint8) (cipher.AEAD, error) {
+	if peerVersion == 3 {
+		return chacha20poly1305.New(key)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
 }
 
 func incNonce(nonce []byte) {
@@ -33,7 +45,7 @@ func incNonce(nonce []byte) {
 }
 
 func (c *seqCipher) encryptInPlace(buf []byte) {
-	plaintext := buf[:len(buf)-chachaPoly1305TagSize]
+	plaintext := buf[:len(buf)-aeadTagSize]
 	c.aead.Seal(plaintext[:0], c.ourNonce[:], plaintext, nil)
 	incNonce(c.ourNonce[:])
 }
@@ -50,7 +62,7 @@ type connSettings struct {
 }
 
 func (cs connSettings) maxFrameSize() int {
-	return cs.PacketSize - chachaPoly1305TagSize
+	return cs.PacketSize - aeadTagSize
 }
 
 func (cs connSettings) maxPayloadSize() int {
@@ -100,11 +112,11 @@ func mergeSettings(ours, theirs connSettings) (connSettings, error) {
 	return merged, nil
 }
 
-func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings connSettings, peerVersion uint8) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// write pubkey
-	buf := make([]byte, 32+64+connSettingsSize+chachaPoly1305TagSize)
+	buf := make([]byte, 32+64+connSettingsSize+aeadTagSize)
 	copy(buf, xpk[:])
 	if _, err := conn.Write(buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write handshake request: %w", err)
@@ -138,33 +150,36 @@ func initiateHandshake(conn net.Conn, theirKey ed25519.PublicKey, ourSettings co
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
 	key := blake2b.Sum256(append(append(secret, xpk[:]...), rxpk[:]...))
-	aead, _ := chacha20poly1305.New(key[:]) // no error possible
+	aead, err := newAEAD(key[:], peerVersion)
+	if err != nil {
+		return nil, connSettings{}, fmt.Errorf("failed to create AEAD cipher: %w", err)
+	}
 	cipher := &seqCipher{aead: aead}
 	cipher.theirNonce[len(cipher.theirNonce)-1] ^= 0x80
 
 	// decrypt settings
 	var mergedSettings connSettings
 	if plaintext, err := cipher.decryptInPlace(buf[32+64:]); err != nil {
-		return nil, connSettings{}, fmt.Errorf("could1 not decrypt settings response: %w", err)
+		return nil, connSettings{}, fmt.Errorf("could not decrypt settings response: %w", err)
 	} else if mergedSettings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
 	}
 
 	// encrypt + write our settings
 	encodeConnSettings(buf, ourSettings)
-	cipher.encryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize])
-	if _, err := conn.Write(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
+	cipher.encryptInPlace(buf[:connSettingsSize+aeadTagSize])
+	if _, err := conn.Write(buf[:connSettingsSize+aeadTagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not write settings: %w", err)
 	}
 
 	return cipher, mergedSettings, nil
 }
 
-func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings) (*seqCipher, connSettings, error) {
+func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connSettings, peerVersion uint8) (*seqCipher, connSettings, error) {
 	xsk, xpk := generateX25519KeyPair()
 
 	// read pubkey
-	buf := make([]byte, 32+64+connSettingsSize+chachaPoly1305TagSize)
+	buf := make([]byte, 32+64+connSettingsSize+aeadTagSize)
 	if _, err := io.ReadFull(conn, buf[:32]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read handshake request: %w", err)
 	}
@@ -179,7 +194,10 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 		return nil, connSettings{}, fmt.Errorf("failed to derive shared cipher: %w", err)
 	}
 	key := blake2b.Sum256(append(append(secret, rxpk[:]...), xpk[:]...))
-	aead, _ := chacha20poly1305.New(key[:])
+	aead, err := newAEAD(key[:], peerVersion)
+	if err != nil {
+		return nil, connSettings{}, fmt.Errorf("failed to create AEAD cipher: %w", err)
+	}
 	cipher := &seqCipher{aead: aead}
 	cipher.ourNonce[len(cipher.ourNonce)-1] ^= 0x80
 
@@ -196,9 +214,9 @@ func acceptHandshake(conn net.Conn, ourKey ed25519.PrivateKey, ourSettings connS
 
 	// read + decrypt settings
 	var settings connSettings
-	if _, err := io.ReadFull(conn, buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
+	if _, err := io.ReadFull(conn, buf[:connSettingsSize+aeadTagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not read settings response: %w", err)
-	} else if plaintext, err := cipher.decryptInPlace(buf[:connSettingsSize+chachaPoly1305TagSize]); err != nil {
+	} else if plaintext, err := cipher.decryptInPlace(buf[:connSettingsSize+aeadTagSize]); err != nil {
 		return nil, connSettings{}, fmt.Errorf("could not decrypt settings response: %w", err)
 	} else if settings, err = mergeSettings(ourSettings, decodeConnSettings(plaintext)); err != nil {
 		return nil, connSettings{}, fmt.Errorf("peer sent unacceptable settings: %w", err)
