@@ -33,7 +33,7 @@ func newAEAD(key []byte, peerVersion uint8) (cipher.AEAD, error) {
 	if peerVersion == 3 {
 		return chacha20poly1305.New(key)
 	}
-	block, err := aes.NewCipher(key[:16])
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
