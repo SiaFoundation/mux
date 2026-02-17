@@ -30,6 +30,7 @@ var (
 	ErrPeerClosedConn   = errors.New("peer closed underlying connection")
 	ErrStreamFlood      = errors.New("too many frames received for closed stream")
 	ErrUnknownStream    = errors.New("frame received for unknown stream")
+	ErrInactiveConn     = errors.New("connection closed due to inactivity")
 )
 
 const (
@@ -42,6 +43,10 @@ const (
 	// stream before we consider the peer to be acting maliciously and close the
 	// mux.
 	maxClosedFrames = 1000 // ~4MiB on default settings
+
+	// maxKeepalives is the maximum number of consecutive keepalives to send
+	// without any other traffic before closing the mux.
+	maxKeepalives = 4
 )
 
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
@@ -56,6 +61,7 @@ type Mux struct {
 	streams        map[uint32]*Stream
 	closingStreams map[uint32]closingStream // streams closed by us
 	nextID         uint32
+	remKeepalives  int
 	err            error // sticky and fatal
 	writeBuf       []byte
 	covertBuf      []byte
@@ -190,7 +196,14 @@ func (m *Mux) writeLoop() {
 		// NOTE: even if we were woken by the keepalive timer, there might be a
 		// normal frame ready to send, in which case we don't need a keepalive
 		if len(m.writeBuf) == 0 {
+			if m.remKeepalives--; m.remKeepalives == 0 {
+				m.mu.Unlock()
+				m.setErr(ErrInactiveConn)
+				return
+			}
 			m.writeBuf = appendFrame(m.writeBuf[:0], frameHeader{id: idKeepalive}, nil)
+		} else {
+			m.remKeepalives = maxKeepalives
 		}
 		// pad to packet boundary
 		if len(m.writeBuf)%m.settings.maxFrameSize() != 0 {
@@ -282,6 +295,7 @@ func (m *Mux) readLoop() {
 		// look for matching Stream
 		var stream *Stream
 		m.mu.Lock()
+		m.remKeepalives = maxKeepalives
 		if s := m.streams[h.id]; s != nil {
 			stream = s
 		} else {
@@ -437,6 +451,7 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 		settings:       settings,
 		streams:        make(map[uint32]*Stream),
 		nextID:         idLowestStream,
+		remKeepalives:  maxKeepalives,
 		writeBuf:       make([]byte, 0, settings.maxFrameSize()*10),
 		covertBuf:      make([]byte, 0, settings.maxPayloadSize()*2),
 	}

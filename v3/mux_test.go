@@ -585,6 +585,64 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	}
 }
 
+func TestKeepaliveTimeout(t *testing.T) {
+	settings := connSettings{
+		PacketSize: 1220,
+		MaxTimeout: 100 * time.Millisecond,
+	}
+	keepaliveInterval := settings.MaxTimeout - settings.MaxTimeout/4 // 75ms
+
+	t.Run("idle", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		go io.Copy(io.Discard, c2)
+		defer c2.Close()
+
+		key := make([]byte, 32)
+		aead, _ := chacha20poly1305.New(key)
+		m := newMux(c1, &seqCipher{aead: aead}, settings)
+		defer m.Close()
+
+		_, err := m.AcceptStream()
+		if !errors.Is(err, ErrInactiveConn) {
+			t.Fatalf("expected ErrInactiveConn, got %v", err)
+		}
+	})
+
+	t.Run("resets on activity", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		key := make([]byte, 32)
+		aead1, _ := chacha20poly1305.New(key)
+		cipher1 := &seqCipher{aead: aead1}
+		cipher1.theirNonce[len(cipher1.theirNonce)-1] ^= 0x80
+		aead2, _ := chacha20poly1305.New(key)
+		cipher2 := &seqCipher{aead: aead2}
+		cipher2.ourNonce[len(cipher2.ourNonce)-1] ^= 0x80
+
+		m1 := newMux(c1, cipher1, settings)
+		m2 := newMux(c2, cipher2, settings)
+		m2.nextID++
+		defer m1.Close()
+		defer m2.Close()
+
+		handleStreams(m2, func(s *Stream) error {
+			io.Copy(io.Discard, s)
+			return nil
+		})
+
+		// The idle timeout is maxKeepalives * keepaliveInterval = 300ms.
+		// Send traffic for longer than that to prove the counter resets.
+		s := m1.DialStream()
+		deadline := time.Now().Add(keepaliveInterval * maxKeepalives * 2)
+		for time.Now().Before(deadline) {
+			if _, err := s.Write([]byte("ping")); err != nil {
+				t.Fatal("mux closed during active period:", err)
+			}
+			time.Sleep(keepaliveInterval / 2)
+		}
+		s.Close()
+	})
+}
+
 func BenchmarkMux(b *testing.B) {
 	for _, numStreams := range []int{1, 2, 10, 100, 500, 1000} {
 		b.Run(fmt.Sprint(numStreams), func(b *testing.B) {
