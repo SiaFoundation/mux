@@ -1,8 +1,6 @@
 module go.sia.tech/mux
 
-go 1.25
-
-toolchain go1.25.5
+go 1.26.0
 
 require (
 	golang.org/x/crypto v0.47.0
