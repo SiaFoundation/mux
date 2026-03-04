@@ -2,7 +2,6 @@ package mux
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -58,7 +57,6 @@ type Mux struct {
 	nextID         uint32
 	err            error // sticky and fatal
 	writeBuf       []byte
-	covertBuf      []byte
 	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
@@ -100,10 +98,9 @@ func (m *Mux) setErr(err error) error {
 	return err
 }
 
-// bufferFrame blocks until it can store its frame in m.writeBuf (or, for covert
-// streams, m.covertBuf). It returns early with an error if m.err is set or if
-// the deadline expires.
-func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time, covert bool) error {
+// bufferFrame blocks until it can store its frame in m.writeBuf. It returns
+// early with an error if m.err is set or if the deadline expires.
+func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !deadline.IsZero() {
@@ -114,13 +111,8 @@ func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time, cov
 		defer timer.Stop()
 	}
 	// block until we can add the frame to the buffer
-	buf := &m.writeBuf
 	maxBufSize := m.settings.maxPayloadSize() * 10
-	if covert {
-		buf = &m.covertBuf
-		maxBufSize = m.settings.maxPayloadSize() * 2
-	}
-	for len(*buf)+frameHeaderSize+len(payload) > maxBufSize && m.err == nil && (deadline.IsZero() || time.Now().Before(deadline)) {
+	for len(m.writeBuf)+frameHeaderSize+len(payload) > maxBufSize && m.err == nil && (deadline.IsZero() || time.Now().Before(deadline)) {
 		m.bufferCond.Wait()
 	}
 	if m.err != nil {
@@ -134,29 +126,19 @@ func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time, cov
 	// After all, a successful write() syscall doesn't mean that the peer
 	// actually received the data, just that the packets are sitting in a kernel
 	// buffer somewhere.
-	*buf = appendFrame(*buf, h, payload)
+	m.writeBuf = appendFrame(m.writeBuf, h, payload)
 	m.cond.Broadcast()
 
-	if covert {
-		// wake all other bufferFrame calls
-		//
-		// NOTE: this causes lots of spurious wakeups. Covert bandwidth is
-		// precious, though, so it's better to take a small performance hit to
-		// ensure that we're making use of whatever bandwidth is available.
-		// If it becomes a problem, we can easily add a separate sync.Cond.
-		m.bufferCond.Broadcast()
-	} else {
-		// wake at most one bufferFrame call
-		//
-		// NOTE: it's possible that we'll wake the "wrong" bufferFrame call, i.e.
-		// one whose payload is too large to fit in the buffer. This means we won't
-		// buffer any additional frames until the writeLoop flushes the buffer.
-		// Calling Broadcast instead of Signal prevents this, but also incurs a
-		// massive performance penalty when there are many concurrent streams. We
-		// could probably get the best of both worlds with a more sophisticated
-		// buffering strategy, but the current implementation is fast enough.
-		m.bufferCond.Signal()
-	}
+	// wake at most one bufferFrame call
+	//
+	// NOTE: it's possible that we'll wake the "wrong" bufferFrame call, i.e.
+	// one whose payload is too large to fit in the buffer. This means we won't
+	// buffer any additional frames until the writeLoop flushes the buffer.
+	// Calling Broadcast instead of Signal prevents this, but also incurs a
+	// massive performance penalty when there are many concurrent streams. We
+	// could probably get the best of both worlds with a more sophisticated
+	// buffering strategy, but the current implementation is fast enough.
+	m.bufferCond.Signal()
 	return nil
 }
 
@@ -199,12 +181,6 @@ func (m *Mux) writeLoop() {
 			pad := m.writeBuf[len(m.writeBuf)-padding:]
 			for i := range pad {
 				pad[i] = 0
-			}
-			// replace padding with covert data, if available
-			if len(m.covertBuf) > 0 && len(pad) > 1 {
-				pad[0] = 0b10 // sentinel byte; see packetReader
-				n := copy(pad[1:], m.covertBuf)
-				m.covertBuf = append(m.covertBuf[:0], m.covertBuf[n:]...)
 			}
 		}
 		// split into packets and encrypt
@@ -267,7 +243,7 @@ func (m *Mux) readLoop() {
 	})
 
 	for {
-		h, payload, covert, err := pr.nextFrame(frameBuf)
+		h, payload, err := pr.nextFrame(frameBuf)
 		if err != nil {
 			m.setErr(err)
 			return
@@ -275,7 +251,7 @@ func (m *Mux) readLoop() {
 		if h.id == idKeepalive {
 			continue // no action required
 		} else if h.id < idLowestStream {
-			m.setErr(fmt.Errorf("peer sent invalid frame ID (%v) (covert=%v, length=%v, flags=%v)", h.id, covert, h.length, h.flags))
+			m.setErr(fmt.Errorf("peer sent invalid frame ID (%v) (length=%v, flags=%v)", h.id, h.length, h.flags))
 			return
 		}
 
@@ -321,7 +297,6 @@ func (m *Mux) readLoop() {
 				id:          h.id,
 				needAccept:  true,
 				cond:        sync.Cond{L: new(sync.Mutex)},
-				covert:      covert,
 				established: true,
 			}
 			m.streams[h.id] = stream
@@ -392,42 +367,6 @@ func (m *Mux) DialStream() *Stream {
 	return s
 }
 
-// DialCovertStream creates a new covert Stream. Covert Streams hide their
-// payloads within the padding of other Streams, making them effectively
-// invisible to traffic analysis.
-//
-// Unlike e.g. net.Dial, this does not perform any I/O; the peer will not be
-// aware of the new Stream until Write is called.
-func (m *Mux) DialCovertStream() *Stream {
-	s := m.DialStream()
-	s.covert = true
-	return s
-}
-
-// DialStreamContext creates a new Stream with the provided context. When the
-// context expires, the Stream will be closed and any pending calls will return
-// ctx.Err(). DialStreamContext spawns a goroutine whose lifetime matches that
-// of the context.
-//
-// Unlike e.g. net.Dial, this does not perform any I/O; the peer will not be
-// aware of the new Stream until Write is called.
-//
-// Deprecated: To associate a Stream with a context, use a helper function as
-// described here: https://github.com/SiaFoundation/mux/pull/2#issuecomment-2351171318
-func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
-	s := m.DialStream()
-	go func() {
-		<-ctx.Done()
-		s.cond.L.Lock()
-		defer s.cond.L.Unlock()
-		if ctx.Err() != nil && s.err == nil {
-			s.err = ctx.Err()
-			s.cond.Broadcast()
-		}
-	}()
-	return s
-}
-
 // newMux initializes a Mux and spawns its readLoop and writeLoop goroutines.
 func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 	m := &Mux{
@@ -438,7 +377,6 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 		streams:        make(map[uint32]*Stream),
 		nextID:         idLowestStream,
 		writeBuf:       make([]byte, 0, settings.maxFrameSize()*10),
-		covertBuf:      make([]byte, 0, settings.maxPayloadSize()*2),
 	}
 	// both conds use the same mutex
 	m.cond.L = &m.mu
@@ -449,8 +387,8 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 }
 
 // Dial initiates a mux protocol handshake on the provided conn.
-func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
-	cipher, settings, err := initiateHandshake(conn, theirKey, defaultConnSettings)
+func Dial(conn net.Conn, theirKey ed25519.PublicKey, peerVersion uint8) (*Mux, error) {
+	cipher, settings, err := initiateHandshake(conn, theirKey, defaultConnSettings, peerVersion)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
@@ -458,8 +396,8 @@ func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
 }
 
 // Accept reciprocates a mux protocol handshake on the provided conn.
-func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
-	cipher, settings, err := acceptHandshake(conn, ourKey, defaultConnSettings)
+func Accept(conn net.Conn, ourKey ed25519.PrivateKey, peerVersion uint8) (*Mux, error) {
+	cipher, settings, err := acceptHandshake(conn, ourKey, defaultConnSettings, peerVersion)
 	if err != nil {
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
@@ -474,15 +412,15 @@ var anonPubkey = anonPrivkey.Public().(ed25519.PublicKey)
 // DialAnonymous initiates a mux protocol handshake to a party without a
 // pre-established identity. The counterparty must reciprocate the handshake with
 // AcceptAnonymous.
-func DialAnonymous(conn net.Conn) (*Mux, error) {
-	return Dial(conn, anonPubkey)
+func DialAnonymous(conn net.Conn, peerVersion uint8) (*Mux, error) {
+	return Dial(conn, anonPubkey, peerVersion)
 }
 
 // AcceptAnonymous reciprocates a mux protocol handshake without a
 // pre-established identity. The counterparty must initiate the handshake with
 // DialAnonymous.
-func AcceptAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
-	return Accept(conn, anonPrivkey)
+func AcceptAnonymous(conn net.Conn, peerVersion uint8) (*Mux, error) {
+	return Accept(conn, anonPrivkey, peerVersion)
 }
 
 // A Stream is a duplex connection multiplexed over a net.Conn. It implements
@@ -490,7 +428,6 @@ func AcceptAnonymous(conn net.Conn, theirVersion uint8) (*Mux, error) {
 type Stream struct {
 	m          *Mux
 	id         uint32
-	covert     bool
 	needAccept bool // managed by Mux
 
 	cond        sync.Cond // guards + synchronizes subsequent fields
@@ -631,7 +568,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 			length: uint16(len(payload)),
 			flags:  flags,
 		}
-		err = s.m.bufferFrame(h, payload, s.wd, s.covert)
+		err = s.m.bufferFrame(h, payload, s.wd)
 		if err != nil {
 			return len(p) - buf.Len(), err
 		}
@@ -660,7 +597,7 @@ func (s *Stream) Close() error {
 		id:    s.id,
 		flags: flagLast,
 	}
-	err := s.m.bufferFrame(h, nil, s.wd, s.covert)
+	err := s.m.bufferFrame(h, nil, s.wd)
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}

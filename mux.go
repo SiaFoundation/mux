@@ -8,12 +8,12 @@ import (
 	"net"
 	"time"
 
-	muxv3 "go.sia.tech/mux/v3"
+	muxv4 "go.sia.tech/mux/v4"
 )
 
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
 type Mux struct {
-	m3 *muxv3.Mux
+	m3 *muxv4.Mux
 }
 
 // Close closes the underlying net.Conn.
@@ -39,7 +39,7 @@ func (m *Mux) DialStream() *Stream {
 func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
 	// exchange versions
 	var theirVersion [1]byte
-	if _, err := conn.Write([]byte{3}); err != nil {
+	if _, err := conn.Write([]byte{4}); err != nil {
 		return nil, fmt.Errorf("could not write our version: %w", err)
 	} else if _, err := io.ReadFull(conn, theirVersion[:]); err != nil {
 		return nil, fmt.Errorf("could not read peer version: %w", err)
@@ -49,7 +49,7 @@ func Dial(conn net.Conn, theirKey ed25519.PublicKey) (*Mux, error) {
 	if theirVersion[0] < 3 {
 		return nil, errors.New("versions 1 and 2 are no longer supported")
 	}
-	m, err := muxv3.Dial(conn, theirKey)
+	m, err := muxv4.Dial(conn, theirKey, theirVersion[0])
 	return &Mux{m3: m}, err
 }
 
@@ -59,7 +59,7 @@ func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
 	var theirVersion [1]byte
 	if _, err := io.ReadFull(conn, theirVersion[:]); err != nil {
 		return nil, fmt.Errorf("could not read peer version: %w", err)
-	} else if _, err := conn.Write([]byte{3}); err != nil {
+	} else if _, err := conn.Write([]byte{4}); err != nil {
 		return nil, fmt.Errorf("could not write our version: %w", err)
 	} else if theirVersion[0] == 0 {
 		return nil, errors.New("peer sent invalid version")
@@ -67,7 +67,7 @@ func Accept(conn net.Conn, ourKey ed25519.PrivateKey) (*Mux, error) {
 	if theirVersion[0] < 3 {
 		return nil, errors.New("versions 1 and 2 are no longer supported")
 	}
-	m, err := muxv3.Accept(conn, ourKey)
+	m, err := muxv4.Accept(conn, ourKey, theirVersion[0])
 	return &Mux{m3: m}, err
 }
 
@@ -87,7 +87,7 @@ func AcceptAnonymous(conn net.Conn) (*Mux, error) { return Accept(conn, anonPriv
 // A Stream is a duplex connection multiplexed over a net.Conn. It implements
 // the net.Conn interface.
 type Stream struct {
-	s3 *muxv3.Stream
+	s3 *muxv4.Stream
 }
 
 // LocalAddr returns the underlying connection's LocalAddr.
