@@ -675,7 +675,7 @@ func (s *Stream) Close() error {
 		id:    s.id,
 		flags: flagLast,
 	}
-	err := s.m.bufferFrame(h, nil, s.wd, s.covert)
+	err := s.m.bufferFrame(h, nil, time.Now().Add(30*time.Second), s.covert)
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}
