@@ -829,6 +829,58 @@ func BenchmarkCovertStream(b *testing.B) {
 	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "frames/sec")
 }
 
+func TestCloseAfterTimeout(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	m1, m2 := newTestingPair(t)
+
+	// on the server side, block on Read until the stream is closed
+	serverDone := make(chan error, 1)
+	_ = handleStreams(m2, func(s *Stream) error {
+		_, err := io.Copy(io.Discard, s)
+		serverDone <- err
+		return err
+	})
+
+	s := m1.DialStream()
+
+	// establish the stream with an initial write so the peer is aware of it
+	if _, err := s.Write([]byte("established")); err != nil {
+		t.Fatal(err)
+	}
+
+	// set a very short timeout and sleep past it
+	s.SetDeadline(time.Now().Add(time.Millisecond))
+	time.Sleep(10 * time.Millisecond)
+
+	// write should fail with a timeout error
+	_, err := s.Write([]byte("hello"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded error, got %v", err)
+	}
+
+	// Close should still succeed after a timeout
+	if err := s.Close(); err != nil {
+		t.Fatal("expected Close to succeed, got", err)
+	}
+
+	// the server side should be unblocked
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal("expected peer closed stream error on server side without an error, got", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server side was not unblocked after Close")
+	}
+
+	if err := m1.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func BenchmarkPackets(b *testing.B) {
 	for _, packetSize := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20} {
 		b.Run(fmt.Sprintf("%dx%d", ipv6MTU, packetSize), func(b *testing.B) {
