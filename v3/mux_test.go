@@ -248,14 +248,14 @@ func TestDeadline(t *testing.T) {
 			s.SetDeadline(time.Now().Add(time.Hour)) // plenty of time
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond)) // too short
+			s.SetDeadline(time.Now()) // too short
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetReadDeadline(time.Time{}) // Write should still fail
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetWriteDeadline(time.Time{}) // Read should still fail
 		}},
 		{false, func(s *Stream) {
@@ -263,7 +263,7 @@ func TestDeadline(t *testing.T) {
 			s.SetDeadline(time.Time{}) // should overwrite
 		}},
 		{false, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetWriteDeadline(time.Time{}) // overwrites Read
 			s.SetReadDeadline(time.Time{})  // overwrites Write
 		}},
@@ -272,6 +272,14 @@ func TestDeadline(t *testing.T) {
 		err := func() error {
 			s := m1.DialStream()
 			defer s.Close()
+			if _, err := s.Write([]byte{0}); err != nil {
+				// establish stream before setting deadlines to avoid the server
+				// getting an "received packet for unknown stream" error. That
+				// happens when the first write fails due to the timeout and
+				// then Close sending the final frame that isn't known to the
+				// peer.
+				return err
+			}
 			test.fn(s) // set deadlines
 
 			// need to write a fairly large message; otherwise the packets just
