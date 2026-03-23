@@ -5,6 +5,7 @@ go 1.25.0
 toolchain go1.25.5
 
 require (
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.49.0
 	lukechampine.com/frand v1.5.1
 )

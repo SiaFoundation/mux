@@ -15,9 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
 	"golang.org/x/crypto/chacha20poly1305"
 	"lukechampine.com/frand"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	l, err := net.Listen("tcp", ":0")
@@ -59,13 +64,19 @@ func handleStreams(m *Mux, fn func(*Stream) error) chan error {
 		for {
 			s, err := m.AcceptStream()
 			if err != nil {
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 			go func() {
 				defer s.Close()
 				if err := fn(s); err != nil {
-					errChan <- err
+					select {
+					case errChan <- err:
+					default:
+					}
 					return
 				}
 			}()
