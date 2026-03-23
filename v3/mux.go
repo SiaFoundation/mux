@@ -665,6 +665,16 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 // Close closes the Stream. The underlying connection is not closed.
 func (s *Stream) Close() error {
+	// always delete stream from Mux after closing it
+	defer func() {
+		s.m.mu.Lock()
+		delete(s.m.streams, s.id)
+		s.m.closingStreams[s.id] = closingStream{
+			closed: time.Now(),
+		}
+		s.m.mu.Unlock()
+	}()
+
 	// cancel outstanding Read/Write calls
 	//
 	// NOTE: Read calls will be interrupted immediately, but Write calls might
@@ -688,14 +698,6 @@ func (s *Stream) Close() error {
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}
-
-	// delete stream from Mux
-	s.m.mu.Lock()
-	delete(s.m.streams, s.id)
-	s.m.closingStreams[s.id] = closingStream{
-		closed: time.Now(),
-	}
-	s.m.mu.Unlock()
 	return nil
 }
 
