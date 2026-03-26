@@ -694,7 +694,12 @@ func (s *Stream) Close() error {
 		id:    s.id,
 		flags: flagLast,
 	}
-	err := s.m.bufferFrame(h, nil, time.Now().Add(30*time.Second), s.covert)
+
+	// Normally, we use s.wd as the deadline when sending frames, but in this
+	// case, it's possible that we're closing because s.wd expired. So to
+	// prevent bufferFrame from failing immediately, we use an explicit
+	// deadline.
+	err := s.m.bufferFrame(h, nil, time.Now().Add(10*time.Second), s.covert)
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}
