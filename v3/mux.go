@@ -686,16 +686,24 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.err = ErrClosedStream
+	established := s.established
 	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
+
+	// if the stream was never established (no frames were sent to the peer),
+	// don't send a flagLast frame since the peer doesn't know about this stream
+	// and would treat it as an error.
+	if !established {
+		return nil
+	}
 
 	h := frameHeader{
 		id:    s.id,
 		flags: flagLast,
 	}
 
-	// Normally, we use s.wd as the deadline when sending frames, but in this
+	// normally, we use s.wd as the deadline when sending frames, but in this
 	// case, it's possible that we're closing because s.wd expired. So to
 	// prevent bufferFrame from failing immediately, we use an explicit
 	// deadline.
