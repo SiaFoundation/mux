@@ -272,10 +272,19 @@ func (m *Mux) readLoop() {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	cleanupTicker := time.NewTicker(closingStreamCleanupInterval)
-	defer cleanupTicker.Stop()
+	cleanupDone := make(chan struct{})
+	defer func() {
+		cleanupTicker.Stop()
+		close(cleanupDone)
+	}()
 	wg.Go(func() {
-		for range cleanupTicker.C {
-			m.pruneClosedStreams()
+		for {
+			select {
+			case <-cleanupDone:
+				return
+			case <-cleanupTicker.C:
+				m.pruneClosedStreams()
+			}
 		}
 	})
 
@@ -656,6 +665,16 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 // Close closes the Stream. The underlying connection is not closed.
 func (s *Stream) Close() error {
+	// always delete stream from Mux after closing it
+	defer func() {
+		s.m.mu.Lock()
+		delete(s.m.streams, s.id)
+		s.m.closingStreams[s.id] = closingStream{
+			closed: time.Now(),
+		}
+		s.m.mu.Unlock()
+	}()
+
 	// cancel outstanding Read/Write calls
 	//
 	// NOTE: Read calls will be interrupted immediately, but Write calls might
@@ -667,26 +686,31 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.err = ErrClosedStream
+	established := s.established
 	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
+
+	// if the stream was never established (no frames were sent to the peer),
+	// don't send a flagLast frame since the peer doesn't know about this stream
+	// and would treat it as an error.
+	if !established {
+		return nil
+	}
 
 	h := frameHeader{
 		id:    s.id,
 		flags: flagLast,
 	}
-	err := s.m.bufferFrame(h, nil, s.wd, s.covert)
+
+	// normally, we use s.wd as the deadline when sending frames, but in this
+	// case, it's possible that we're closing because s.wd expired. So to
+	// prevent bufferFrame from failing immediately, we use an explicit
+	// deadline.
+	err := s.m.bufferFrame(h, nil, time.Now().Add(10*time.Second), s.covert)
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}
-
-	// delete stream from Mux
-	s.m.mu.Lock()
-	delete(s.m.streams, s.id)
-	s.m.closingStreams[s.id] = closingStream{
-		closed: time.Now(),
-	}
-	s.m.mu.Unlock()
 	return nil
 }
 

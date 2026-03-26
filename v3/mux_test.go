@@ -15,9 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
 	"golang.org/x/crypto/chacha20poly1305"
 	"lukechampine.com/frand"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	l, err := net.Listen("tcp", ":0")
@@ -59,13 +64,19 @@ func handleStreams(m *Mux, fn func(*Stream) error) chan error {
 		for {
 			s, err := m.AcceptStream()
 			if err != nil {
-				errChan <- err
+				select {
+				case errChan <- err:
+				default:
+				}
 				return
 			}
 			go func() {
 				defer s.Close()
 				if err := fn(s); err != nil {
-					errChan <- err
+					select {
+					case errChan <- err:
+					default:
+					}
 					return
 				}
 			}()
@@ -248,14 +259,14 @@ func TestDeadline(t *testing.T) {
 			s.SetDeadline(time.Now().Add(time.Hour)) // plenty of time
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond)) // too short
+			s.SetDeadline(time.Now()) // too short
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetReadDeadline(time.Time{}) // Write should still fail
 		}},
 		{true, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetWriteDeadline(time.Time{}) // Read should still fail
 		}},
 		{false, func(s *Stream) {
@@ -263,7 +274,7 @@ func TestDeadline(t *testing.T) {
 			s.SetDeadline(time.Time{}) // should overwrite
 		}},
 		{false, func(s *Stream) {
-			s.SetDeadline(time.Now().Add(time.Millisecond))
+			s.SetDeadline(time.Now())
 			s.SetWriteDeadline(time.Time{}) // overwrites Read
 			s.SetReadDeadline(time.Time{})  // overwrites Write
 		}},
@@ -272,6 +283,14 @@ func TestDeadline(t *testing.T) {
 		err := func() error {
 			s := m1.DialStream()
 			defer s.Close()
+			if _, err := s.Write([]byte{0}); err != nil {
+				// establish stream before setting deadlines to avoid the server
+				// getting an "received packet for unknown stream" error. That
+				// happens when the first write fails due to the timeout and
+				// then Close sending the final frame that isn't known to the
+				// peer.
+				return err
+			}
 			test.fn(s) // set deadlines
 
 			// need to write a fairly large message; otherwise the packets just
@@ -827,6 +846,58 @@ func BenchmarkCovertStream(b *testing.B) {
 	}
 	cs.Read(buf[:1]) // ensure that server received all frames
 	b.ReportMetric(float64(b.N)/time.Since(start).Seconds(), "frames/sec")
+}
+
+func TestCloseAfterTimeout(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	m1, m2 := newTestingPair(t)
+
+	// on the server side, block on Read until the stream is closed
+	serverDone := make(chan error, 1)
+	_ = handleStreams(m2, func(s *Stream) error {
+		_, err := io.Copy(io.Discard, s)
+		serverDone <- err
+		return err
+	})
+
+	s := m1.DialStream()
+
+	// establish the stream with an initial write so the peer is aware of it
+	if _, err := s.Write([]byte("established")); err != nil {
+		t.Fatal(err)
+	}
+
+	// set a very short timeout and sleep past it
+	s.SetDeadline(time.Now().Add(time.Millisecond))
+	time.Sleep(10 * time.Millisecond)
+
+	// write should fail with a timeout error
+	_, err := s.Write([]byte("hello"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded error, got %v", err)
+	}
+
+	// Close should still succeed after a timeout
+	if err := s.Close(); err != nil {
+		t.Fatal("expected Close to succeed, got", err)
+	}
+
+	// the server side should be unblocked
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal("expected peer closed stream error on server side without an error, got", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server side was not unblocked after Close")
+	}
+
+	if err := m1.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func BenchmarkPackets(b *testing.B) {
