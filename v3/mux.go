@@ -359,7 +359,8 @@ func (m *Mux) readLoop() {
 	}
 }
 
-// Close closes the underlying net.Conn.
+// Close waits up to 5 seconds for pending writes to flush, then closes the
+// underlying net.Conn.
 func (m *Mux) Close() error {
 	// wait briefly for pending writes to flush before tearing down
 	m.mu.Lock()
