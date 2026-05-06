@@ -1012,8 +1012,7 @@ func TestCloseWithBlockedWrite(t *testing.T) {
 	}
 
 	// refill writeBuf while writeLoop is stuck
-	go s.Write(make([]byte, m1.settings.maxPayloadSize()))
-	time.Sleep(50 * time.Millisecond)
+	s.Write(make([]byte, m1.settings.maxPayloadSize()))
 
 	// assert Close returns
 	closeDone := make(chan error, 1)
