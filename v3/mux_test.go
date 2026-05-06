@@ -25,6 +25,11 @@ func TestMain(m *testing.M) {
 }
 
 func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
+	dialed, accepted = newTestingPairCustom(tb, nil)
+	return
+}
+
+func newTestingPairCustom(tb testing.TB, wrapConn func(net.Conn) net.Conn) (dialed, accepted *Mux) {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		tb.Fatal(err)
@@ -41,6 +46,9 @@ func newTestingPair(tb testing.TB) (dialed, accepted *Mux) {
 	conn, err := net.Dial("tcp", l.Addr().String())
 	if err != nil {
 		tb.Fatal(err)
+	}
+	if wrapConn != nil {
+		conn = wrapConn(conn)
 	}
 	dialed, err = DialAnonymous(conn)
 	if err != nil {
@@ -83,6 +91,44 @@ func handleStreams(m *Mux, fn func(*Stream) error) chan error {
 		}
 	}()
 	return errChan
+}
+
+// blockConn simulates TCP backpressure by blocking writes on demand
+type blockConn struct {
+	net.Conn
+
+	closeOnce sync.Once
+	blockCh   chan struct{} // close to make writes block
+	blockedCh chan struct{} // signaled when a write is waiting
+	closeCh   chan struct{} // closed by Close to release blocked writes
+}
+
+func newBlockConn(c net.Conn) *blockConn {
+	return &blockConn{
+		Conn:      c,
+		blockCh:   make(chan struct{}),
+		blockedCh: make(chan struct{}, 1),
+		closeCh:   make(chan struct{}),
+	}
+}
+
+func (c *blockConn) Write(b []byte) (int, error) {
+	select {
+	case <-c.blockCh:
+		select {
+		case c.blockedCh <- struct{}{}:
+		default:
+		}
+		<-c.closeCh
+		return 0, net.ErrClosed
+	default:
+		return c.Conn.Write(b)
+	}
+}
+
+func (c *blockConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closeCh) })
+	return c.Conn.Close()
 }
 
 func TestMux(t *testing.T) {
@@ -926,5 +972,61 @@ func BenchmarkPackets(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// TestCloseWithBlockedWrite is a regression test for a deadlock in Close()
+// where we would be stuck waiting for writeBuf to drain, which never happens
+// because the writeLoop might block on conn.Write due to TCP backpressure
+func TestCloseWithBlockedWrite(t *testing.T) {
+	var bc *blockConn
+	m1, m2 := newTestingPairCustom(t, func(conn net.Conn) net.Conn {
+		bc = newBlockConn(conn)
+		return bc
+	})
+	defer bc.Close() // unblock writes so cleanup doesn't hang
+
+	handleStreams(m2, func(s *Stream) error {
+		io.Copy(io.Discard, s)
+		return nil
+	})
+
+	// establish stream
+	s := m1.DialStream()
+	if _, err := s.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// block writes
+	close(bc.blockCh)
+
+	// trigger writeLoop to block on conn.Write
+	go s.Write(make([]byte, m1.settings.maxPayloadSize()))
+
+	// wait for writeLoop to block
+	select {
+	case <-bc.blockedCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for conn.Write to block")
+	}
+
+	// refill writeBuf while writeLoop is stuck
+	go s.Write(make([]byte, m1.settings.maxPayloadSize()))
+	time.Sleep(50 * time.Millisecond)
+
+	// assert Close returns
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- m1.Close()
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(closeFlushTimeout + time.Second):
+		t.Fatal("Mux.Close() hung; deadlocked waiting for writeBuf to drain")
 	}
 }
