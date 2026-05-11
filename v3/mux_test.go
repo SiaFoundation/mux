@@ -487,42 +487,54 @@ func TestCovertStream(t *testing.T) {
 				return err
 			}
 			defer m.Close()
-			// accept covert stream
-			cs, err := m.AcceptStream()
-			if err != nil {
-				return err
-			}
-			covertCh := make(chan error)
-			go func() {
-				defer cs.Close()
-				buf := make([]byte, 100)
-				if n, err := cs.Read(buf); err != nil {
-					covertCh <- err
-				} else if _, err := fmt.Fprintf(cs, "hello, %s!", buf[:n]); err != nil {
-					covertCh <- err
-				} else {
-					covertCh <- cs.Close()
-				}
-			}()
-			// accept regular stream
+			// regular stream arrives first since covert data is in the padding
 			s, err := m.AcceptStream()
 			if err != nil {
 				return err
 			}
 			defer s.Close()
-			buf := make([]byte, 100)
-			n, err := s.Read(buf)
+
+			// read s in a goroutine to unblock the readLoop for the covert frame
+			type readRes struct {
+				data []byte
+				err  error
+			}
+			readChan := make(chan readRes, 1)
+			go func() {
+				buf := make([]byte, 100)
+				n, err := s.Read(buf)
+				readChan <- readRes{buf[:n], err}
+			}()
+
+			// accept covert stream
+			cs, err := m.AcceptStream()
 			if err != nil {
 				return err
 			}
-			// wait for covert stream to buffer before writing
-			if err := <-covertCh; err != nil {
+			defer cs.Close()
+
+			// respond to covert stream
+			buf := make([]byte, 100)
+			n, err := cs.Read(buf)
+			if err != nil {
 				return err
 			}
-			if _, err := fmt.Fprintf(s, "hello, %s!", buf[:n]); err != nil {
+			if _, err := fmt.Fprintf(cs, "hello, %s!", buf[:n]); err != nil {
 				return err
 			}
-			io.Copy(io.Discard, s) // wait for the client to finish reading before tearing down
+			if err := cs.Close(); err != nil {
+				return err
+			}
+
+			// respond to regular stream
+			res := <-readChan
+			if res.err != nil {
+				return res.err
+			}
+			if _, err := fmt.Fprintf(s, "hello, %s!", res.data); err != nil {
+				return err
+			}
+			io.Copy(io.Discard, s) // wait for client to close
 			return m.Close()
 		}()
 	}()
