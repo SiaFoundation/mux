@@ -521,9 +521,8 @@ func TestCovertStream(t *testing.T) {
 			}
 			if _, err := fmt.Fprintf(s, "hello, %s!", buf[:n]); err != nil {
 				return err
-			} else if err := s.Close(); err != nil {
-				return err
 			}
+			io.Copy(io.Discard, s) // wait for the client to finish reading before tearing down
 			return m.Close()
 		}()
 	}()
