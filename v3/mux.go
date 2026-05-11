@@ -47,10 +47,6 @@ const (
 	// maxKeepalives is the maximum number of consecutive keepalives to send
 	// without any other traffic before closing the mux.
 	maxKeepalives = 4
-
-	// closeFlushTimeout is the maximum time Close will wait for pending
-	// writes to be flushed before tearing down the connection.
-	closeFlushTimeout = 5 * time.Second
 )
 
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
@@ -359,19 +355,8 @@ func (m *Mux) readLoop() {
 	}
 }
 
-// Close waits up to 5 seconds for pending writes to flush, then closes the
-// underlying net.Conn.
+// Close closes the underlying net.Conn.
 func (m *Mux) Close() error {
-	// wait briefly for pending writes to flush before tearing down
-	m.mu.Lock()
-	deadline := time.Now().Add(closeFlushTimeout)
-	timer := time.AfterFunc(closeFlushTimeout, m.bufferCond.Broadcast)
-	for len(m.writeBuf) != 0 && m.err == nil && time.Now().Before(deadline) {
-		m.bufferCond.Wait()
-	}
-	timer.Stop()
-	m.mu.Unlock()
-
 	err := m.setErr(ErrClosedConn)
 	if err == ErrClosedConn || err == ErrPeerClosedConn {
 		err = nil

@@ -160,6 +160,7 @@ func TestMux(t *testing.T) {
 			} else if _, err := fmt.Fprintf(s, "hello, %s!", buf[:n]); err != nil {
 				return err
 			}
+			io.Copy(io.Discard, s) // blocks until the client closes, ensuring we can read what the server wrote before the mux is closed
 			return s.Close()
 		}()
 	}()
@@ -624,7 +625,6 @@ func TestWriteAfterStreamClose(t *testing.T) {
 		} else if _, err := s.Write(buf[:n]); err != nil {
 			return err
 		}
-		t.Log("handler finished")
 		return nil
 	})
 
@@ -1014,7 +1014,7 @@ func TestCloseWithBlockedWrite(t *testing.T) {
 	// refill writeBuf while writeLoop is stuck
 	s.Write(make([]byte, m1.settings.maxPayloadSize()))
 
-	// assert Close returns
+	// assert Close returns immediately
 	closeDone := make(chan error, 1)
 	go func() {
 		closeDone <- m1.Close()
@@ -1025,7 +1025,7 @@ func TestCloseWithBlockedWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(closeFlushTimeout + time.Second):
-		t.Fatal("Mux.Close() hung; deadlocked waiting for writeBuf to drain")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Close() did not return immediately")
 	}
 }
