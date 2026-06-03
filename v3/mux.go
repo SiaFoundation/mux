@@ -439,6 +439,7 @@ func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
 		defer s.cond.L.Unlock()
 		if ctx.Err() != nil && s.err == nil {
 			s.err = ctx.Err()
+			s.readBuf = nil
 			s.cond.Broadcast()
 		}
 	}()
@@ -588,7 +589,7 @@ func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
 	}
 	s.readBuf = payload
 	s.cond.Broadcast() // wake Read
-	for len(s.readBuf) > 0 {
+	for len(s.readBuf) > 0 && s.err == nil {
 		s.cond.Wait()
 	}
 }
