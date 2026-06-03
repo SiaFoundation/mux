@@ -368,6 +368,15 @@ func TestContext(t *testing.T) {
 		t.SkipNow()
 	}
 
+	const testTimeout = 5 * time.Second
+	waitErr := func(name string, ch <-chan error) error {
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(testTimeout):
+			return fmt.Errorf("timed out waiting for %s", name)
+		}
+	}
 	m1, m2 := newTestingPair(t)
 
 	serverCh := handleStreams(m2, func(s *Stream) error {
@@ -448,7 +457,10 @@ func TestContext(t *testing.T) {
 
 	if err := m1.Close(); err != nil {
 		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn && err != ErrPeerClosedStream {
+	} else if err := waitErr("server", serverCh); err != nil &&
+		err != ErrPeerClosedConn &&
+		err != ErrPeerClosedStream {
+		m2.Close()
 		t.Fatal(err)
 	}
 }
@@ -475,6 +487,31 @@ func TestCovertStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const testTimeout = 5 * time.Second
+	waitErr := func(name string, ch <-chan error) error {
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(testTimeout):
+			return fmt.Errorf("timed out waiting for %s", name)
+		}
+	}
+	waitReady := func(name string, ch <-chan struct{}) error {
+		select {
+		case <-ch:
+			return nil
+		case <-time.After(testTimeout):
+			return fmt.Errorf("timed out waiting for %s", name)
+		}
+	}
+
+	clientDone := make(chan struct{})
+	var signalClientDoneOnce sync.Once
+	signalClientDone := func() {
+		signalClientDoneOnce.Do(func() { close(clientDone) })
+	}
+	defer signalClientDone()
+
 	serverCh := make(chan error, 1)
 	go func() {
 		serverCh <- func() error {
@@ -534,7 +571,11 @@ func TestCovertStream(t *testing.T) {
 			if _, err := fmt.Fprintf(s, "hello, %s!", res.data); err != nil {
 				return err
 			}
-			io.Copy(io.Discard, s) // wait for client to close
+			select {
+			case <-clientDone:
+			case <-time.After(testTimeout):
+				return errors.New("timed out waiting for client to read responses")
+			}
 			return m.Close()
 		}()
 	}()
@@ -573,28 +614,29 @@ func TestCovertStream(t *testing.T) {
 
 	// to generate padding for covert stream, send a regular packet
 	s := m.DialStream()
-	<-bufChan // wait for covert stream to buffer
+	if err := waitReady("covert stream to buffer", bufChan); err != nil {
+		t.Fatal(err)
+	}
 	buf := make([]byte, 100)
 	if _, err := s.Write([]byte("world")); err != nil {
-		t.Log(<-serverCh)
+		t.Log(waitErr("server", serverCh))
 		t.Fatal(err)
 	} else if n, err := io.ReadFull(s, buf[:13]); err != nil {
-		t.Log(<-serverCh)
+		t.Log(waitErr("server", serverCh))
 		t.Fatal(err)
 	} else if string(buf[:n]) != "hello, world!" {
 		t.Fatalf("bad hello: %s", buf[:n])
 	}
 
-	if err := <-covertCh; err != nil && err != ErrPeerClosedConn {
-		t.Fatal(err)
-	} else if err := m.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedStream {
+	if err := waitErr("covert stream", covertCh); err != nil && err != ErrPeerClosedConn {
 		t.Fatal(err)
 	}
-	// wait for read/write goroutines to exit
-	time.Sleep(time.Second)
-
+	signalClientDone()
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	} else if err := waitErr("server", serverCh); err != nil && err != ErrPeerClosedStream {
+		t.Fatal(err)
+	}
 	// amount of data transferred should be the same as without covert stream
 	expWritten := 32 + // key exchange
 		connSettingsSize + chachaPoly1305TagSize + // settings
