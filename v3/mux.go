@@ -719,7 +719,7 @@ func (s *Stream) Close() error {
 	// prevent bufferFrame from failing immediately, we use an explicit
 	// deadline.
 	err := s.m.bufferFrame(s, h, nil, time.Now().Add(10*time.Second), s.covert)
-	if err != nil && err != ErrPeerClosedStream {
+	if err != nil && err != ErrPeerClosedStream && err != ErrClosedStream {
 		return err
 	}
 	return nil
