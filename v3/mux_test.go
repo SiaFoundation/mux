@@ -775,6 +775,8 @@ func TestCloseWriteRace(t *testing.T) {
 		t.Fatalf("m2 closed unexpectedly: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
+
+	m1.Close()
 	wg.Wait()
 }
 
