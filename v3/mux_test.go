@@ -703,6 +703,81 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	}
 }
 
+// TestCloseWriteRace exercises the race acknowledged by Stream.Close: a
+// concurrent Write that has already passed Close's s.err check can buffer a
+// data frame after the flagLast frame, which the peer's readLoop currently
+// rejects with ErrUnknownStream. The test repeatedly runs Write and Close in
+// parallel and fails if the peer ever surfaces ErrUnknownStream. After the
+// race is fixed (e.g. by tracking peer-closed streams in closingStreams), the
+// test should pass.
+func TestCloseWriteRace(t *testing.T) {
+	m1, m2 := newTestingPair(t)
+
+	// Surface m2's mux-level error as soon as it occurs.
+	m2Err := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			s, err := m2.AcceptStream()
+			if err != nil {
+				select {
+				case m2Err <- err:
+				default:
+				}
+				return
+			}
+			wg.Go(func() {
+				io.Copy(io.Discard, s)
+				s.Close()
+			})
+		}
+	})
+
+	const attempts = 500
+	for i := range attempts {
+		// check if failure has already occurred
+		select {
+		case err := <-m2Err:
+			if errors.Is(err, ErrUnknownStream) {
+				t.Fatalf("attempt %d: m2 closed with ErrUnknownStream (Write/Close race reproduced)", i)
+			}
+			t.Fatalf("attempt %d: m2 closed unexpectedly: %v", i, err)
+		default:
+		}
+
+		// establish a stream by dialing it and writing a byte
+		s := m1.DialStream()
+		if _, err := s.Write([]byte("x")); err != nil {
+			t.Fatalf("attempt %d: establishing Write failed: %v", i, err)
+		}
+
+		// simultaneously write and close the stream. Simulating a stream that
+		// gets interrupted by a close.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		wg.Go(func() {
+			defer wg.Done()
+			s.Write(make([]byte, 1<<16))
+		})
+		wg.Go(func() {
+			defer wg.Done()
+			s.Close()
+		})
+		wg.Wait()
+	}
+
+	// no ErrUnknownStream errors should have been observed
+	select {
+	case err := <-m2Err:
+		if errors.Is(err, ErrUnknownStream) {
+			t.Fatal("m2 closed with ErrUnknownStream (Write/Close race reproduced)")
+		}
+		t.Fatalf("m2 closed unexpectedly: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	wg.Wait()
+}
+
 func TestKeepaliveTimeout(t *testing.T) {
 	settings := connSettings{
 		PacketSize: 1220,
