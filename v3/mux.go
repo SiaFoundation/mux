@@ -146,6 +146,9 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 		sErr := s.err
 		s.cond.L.Unlock()
 		if sErr != nil {
+			// we aren't appending, so we wake up the next bufferFrame call
+			// which might be able to append to the buffer now.
+			m.bufferCond.Signal()
 			return sErr
 		}
 	}

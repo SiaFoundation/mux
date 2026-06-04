@@ -703,13 +703,8 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	}
 }
 
-// TestCloseWriteRace exercises the race acknowledged by Stream.Close: a
-// concurrent Write that has already passed Close's s.err check can buffer a
-// data frame after the flagLast frame, which the peer's readLoop currently
-// rejects with ErrUnknownStream. The test repeatedly runs Write and Close in
-// parallel and fails if the peer ever surfaces ErrUnknownStream. After the
-// race is fixed (e.g. by tracking peer-closed streams in closingStreams), the
-// test should pass.
+// TestCloseWriteRace ensures that concurrently calling Write and Close on the
+// same Stream never causes the peer mux to close with ErrUnknownStream.
 func TestCloseWriteRace(t *testing.T) {
 	m1, m2 := newTestingPair(t)
 
@@ -754,13 +749,10 @@ func TestCloseWriteRace(t *testing.T) {
 		// simultaneously write and close the stream. Simulating a stream that
 		// gets interrupted by a close.
 		var wg sync.WaitGroup
-		wg.Add(2)
 		wg.Go(func() {
-			defer wg.Done()
 			s.Write(make([]byte, 1<<16))
 		})
 		wg.Go(func() {
-			defer wg.Done()
 			s.Close()
 		})
 		wg.Wait()
