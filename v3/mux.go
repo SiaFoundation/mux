@@ -656,7 +656,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 		var flags uint16
 		if err == nil && !s.established {
 			flags = flagFirst
-			s.established = true
 		}
 		s.cond.L.Unlock()
 		if err != nil {
@@ -672,6 +671,14 @@ func (s *Stream) Write(p []byte) (int, error) {
 		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
 		if err != nil {
 			return len(p) - buf.Len(), err
+		}
+		// only mark the stream as established after the flagFirst frame has
+		// been successfully queued, otherwise a later Close could send a
+		// flagLast frame for a stream the peer never learned about.
+		if flags&flagFirst != 0 {
+			s.cond.L.Lock()
+			s.established = true
+			s.cond.L.Unlock()
 		}
 	}
 	return len(p), nil

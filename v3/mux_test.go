@@ -708,7 +708,7 @@ func TestWriteAfterStreamClose(t *testing.T) {
 func TestCloseWriteRace(t *testing.T) {
 	m1, m2 := newTestingPair(t)
 
-	// Surface m2's mux-level error as soon as it occurs.
+	// surface m2's mux-level error as soon as it occurs.
 	m2Err := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Go(func() {
