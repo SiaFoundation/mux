@@ -703,6 +703,85 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	}
 }
 
+// TestCloseUnestablishedStream ensures that closing a Stream that was dialed
+// but never written to does not send a flagLast frame to the peer, which would
+// cause the peer mux to close with ErrUnknownStream.
+func TestCloseUnestablishedStream(t *testing.T) {
+	m1, m2 := newTestingPair(t)
+
+	serverCh := handleStreams(m2, func(s *Stream) error {
+		io.Copy(io.Discard, s)
+		return nil
+	})
+
+	if err := m1.DialStream().Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// no frames should have been sent to the peer
+	select {
+	case err := <-serverCh:
+		t.Fatalf("m2 closed unexpectedly: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if err := m1.Close(); err != nil {
+		t.Fatal(err)
+	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
+		t.Fatal(err)
+	}
+}
+
+// TestCloseUnestablishedStreamRace ensures that racing Write and Close on a
+// freshly-dialed Stream never leaves the peer with an orphaned stream: either
+// no frames are sent at all, or both flagFirst and flagLast are sent.
+func TestCloseUnestablishedStreamRace(t *testing.T) {
+	m1, m2 := newTestingPair(t)
+
+	serverCh := handleStreams(m2, func(s *Stream) error {
+		io.Copy(io.Discard, s)
+		return nil
+	})
+
+	const attempts = 500
+	for i := range attempts {
+		s := m1.DialStream()
+		var wg sync.WaitGroup
+		wg.Go(func() { s.Write([]byte("x")) })
+		wg.Go(func() { s.Close() })
+		wg.Wait()
+
+		select {
+		case err := <-serverCh:
+			t.Fatalf("attempt %d: m2 closed unexpectedly: %v", i, err)
+		default:
+		}
+	}
+
+	// any stream the peer accepted must have also received flagLast;
+	// otherwise it stays in m2.streams with a blocked io.Copy goroutine.
+	leaked := -1
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m2.mu.Lock()
+		leaked = len(m2.streams)
+		m2.mu.Unlock()
+		if leaked == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if leaked != 0 {
+		t.Fatalf("m2 has %d orphaned streams (Write/Close race left flagFirst without flagLast)", leaked)
+	}
+
+	if err := m1.Close(); err != nil {
+		t.Fatal(err)
+	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
+		t.Fatal(err)
+	}
+}
+
 // TestCloseWriteRace ensures that concurrently calling Write and Close on the
 // same Stream never causes the peer mux to close with ErrUnknownStream.
 func TestCloseWriteRace(t *testing.T) {

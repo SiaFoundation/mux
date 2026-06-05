@@ -140,17 +140,22 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 
 	// if this is a normal frame, check for stream error. Upon Close, the
 	// stream's error is set to ErrClosedStream. After that, the only frame that
-	// we allow to be sent is a flagLast frame.
+	// we allow to be sent is a flagLast frame. For flagFirst, also set
+	// s.established under the same lock, otherwise a racing Close can skip
+	// flagLast and leave the peer with a phantom stream.
 	if h.flags&flagLast == 0 {
 		s.cond.L.Lock()
-		sErr := s.err
-		s.cond.L.Unlock()
-		if sErr != nil {
+		if s.err != nil {
+			s.cond.L.Unlock()
 			// we aren't appending, so we wake up the next bufferFrame call
 			// which might be able to append to the buffer now.
 			m.bufferCond.Signal()
-			return sErr
+			return s.err
 		}
+		if h.flags&flagFirst != 0 {
+			s.established = true
+		}
+		s.cond.L.Unlock()
 	}
 
 	// queue our frame and wake the writeLoop
@@ -671,14 +676,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
 		if err != nil {
 			return len(p) - buf.Len(), err
-		}
-		// only mark the stream as established after the flagFirst frame has
-		// been successfully queued, otherwise a later Close could send a
-		// flagLast frame for a stream the peer never learned about.
-		if flags&flagFirst != 0 {
-			s.cond.L.Lock()
-			s.established = true
-			s.cond.L.Unlock()
 		}
 	}
 	return len(p), nil
