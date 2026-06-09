@@ -107,9 +107,12 @@ func (m *Mux) setErr(err error) error {
 }
 
 // bufferFrame blocks until it can store its frame in m.writeBuf (or, for covert
-// streams, m.covertBuf). It returns early with an error if m.err is set or if
-// the deadline expires.
-func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time, covert bool) error {
+// streams, m.covertBuf). It returns early with an error if m.err is set, if
+// s.err is set (unless the frame itself is flagLast), or if the deadline
+// expires. Re-checking s.err under m.mu is what guarantees that once Close
+// has queued its flagLast frame, no further frames for the same stream can
+// be queued behind it.
+func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline time.Time, covert bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !deadline.IsZero() {
@@ -134,6 +137,27 @@ func (m *Mux) bufferFrame(h frameHeader, payload []byte, deadline time.Time, cov
 	} else if !deadline.IsZero() && !time.Now().Before(deadline) {
 		return os.ErrDeadlineExceeded
 	}
+
+	// if this is a normal frame, check for stream error. Upon Close, the
+	// stream's error is set to ErrClosedStream. After that, the only frame that
+	// we allow to be sent is a flagLast frame. For flagFirst, also set
+	// s.established under the same lock, otherwise a racing Close can skip
+	// flagLast and leave the peer with a phantom stream.
+	if h.flags&flagLast == 0 {
+		s.cond.L.Lock()
+		if s.err != nil {
+			s.cond.L.Unlock()
+			// we aren't appending, so we wake up the next bufferFrame call
+			// which might be able to append to the buffer now.
+			m.bufferCond.Signal()
+			return s.err
+		}
+		if h.flags&flagFirst != 0 {
+			s.established = true
+		}
+		s.cond.L.Unlock()
+	}
+
 	// queue our frame and wake the writeLoop
 	//
 	// NOTE: it is not necessary to wait for the writeLoop to flush our frame.
@@ -637,7 +661,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 		var flags uint16
 		if err == nil && !s.established {
 			flags = flagFirst
-			s.established = true
 		}
 		s.cond.L.Unlock()
 		if err != nil {
@@ -650,7 +673,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 			length: uint16(len(payload)),
 			flags:  flags,
 		}
-		err = s.m.bufferFrame(h, payload, s.wd, s.covert)
+		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
 		if err != nil {
 			return len(p) - buf.Len(), err
 		}
@@ -702,8 +725,8 @@ func (s *Stream) Close() error {
 	// case, it's possible that we're closing because s.wd expired. So to
 	// prevent bufferFrame from failing immediately, we use an explicit
 	// deadline.
-	err := s.m.bufferFrame(h, nil, time.Now().Add(10*time.Second), s.covert)
-	if err != nil && err != ErrPeerClosedStream {
+	err := s.m.bufferFrame(s, h, nil, time.Now().Add(10*time.Second), s.covert)
+	if err != nil && err != ErrPeerClosedStream && err != ErrClosedStream {
 		return err
 	}
 	return nil
