@@ -1,3 +1,10 @@
+## 1.5.2 (2026-06-09)
+
+### Fixes
+
+- Fix NDFs
+- Prevent Stream.Write from sending a frame on an already closed Stream.
+
 ## 1.5.1 (2026-05-13)
 
 ### Fixes
