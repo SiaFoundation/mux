@@ -1,4 +1,4 @@
-module go.sia.tech/mux // v1.5.1
+module go.sia.tech/mux // v1.5.2
 
 go 1.26.0
 
