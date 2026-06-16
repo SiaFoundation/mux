@@ -1242,12 +1242,12 @@ func TestNewStreamDuringShutdown(t *testing.T) {
 	)
 	payload := make([]byte, 16) // a flagFirst frame carrying a 16-byte specifier
 
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		dialed, accepted := newTestingPair(t)
 
 		// fire new-stream frames without reading or closing them, so that a
 		// stream raced past setErr parks in consumeFrame with a full readBuf.
-		for j := 0; j < streamsPerConn; j++ {
+		for range streamsPerConn {
 			s := dialed.DialStream()
 			s.SetDeadline(time.Now().Add(time.Second))
 			if _, err := s.Write(payload); err != nil {
