@@ -363,6 +363,11 @@ func (m *Mux) readLoop() {
 				m.setErr(fmt.Errorf("exceeded concurrent stream limit (%v streams)", maxStreams))
 				return
 			}
+			// If the mux is already dying, do not register a new stream.
+			if m.err != nil {
+				m.mu.Unlock()
+				return
+			}
 			stream = &Stream{
 				m:           m,
 				id:          h.id,

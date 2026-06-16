@@ -1230,3 +1230,35 @@ func TestCloseWithBlockedWrite(t *testing.T) {
 		t.Fatal("Close() did not return immediately")
 	}
 }
+
+// TestNewStreamDuringShutdown checks that opening streams while the mux
+// is being torn down does not leak any goroutines. If readLoop creates a
+// stream after the mux has entered its error state, nothing will ever wake
+// that stream's consumeFrame and the readLoop goroutine parks forever.
+func TestNewStreamDuringShutdown(t *testing.T) {
+	const (
+		iterations     = 200
+		streamsPerConn = 256
+	)
+	payload := make([]byte, 16) // a flagFirst frame carrying a 16-byte specifier
+
+	for range iterations {
+		dialed, accepted := newTestingPair(t)
+
+		// fire new-stream frames without reading or closing them, so that a
+		// stream raced past setErr parks in consumeFrame with a full readBuf.
+		for range streamsPerConn {
+			s := dialed.DialStream()
+			s.SetDeadline(time.Now().Add(time.Second))
+			if _, err := s.Write(payload); err != nil {
+				break
+			}
+		}
+
+		// let the frames reach the server, then tear the mux down while
+		// readLoop is still creating streams from them.
+		time.Sleep(time.Millisecond)
+		accepted.Close()
+		dialed.Close()
+	}
+}
