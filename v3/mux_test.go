@@ -1147,6 +1147,63 @@ func TestCloseAfterTimeout(t *testing.T) {
 	}
 }
 
+// TestCloseUnblocksWrite verifies that closing a Stream unblocks a Write that
+// has stalled because the peer never reads: the peer's readLoop parks in
+// consumeFrame, TCP backpressure blocks the sender's writeLoop, and Write ends
+// up waiting in bufferFrame for buffer space that never frees up.
+func TestCloseUnblocksWrite(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	m1, m2 := newTestingPair(t)
+
+	// the receiver accepts the stream but never reads from it
+	unblockServer := make(chan struct{})
+	defer close(unblockServer)
+	_ = handleStreams(m2, func(s *Stream) error {
+		<-unblockServer
+		return nil
+	})
+
+	s := m1.DialStream()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := s.Write(make([]byte, 4<<20))
+		writeDone <- err
+	}()
+
+	// after 1 second the Write should still be blocked on backpressure
+	select {
+	case err := <-writeDone:
+		t.Fatalf("Write returned before Close was called: %v", err)
+	case <-time.After(time.Second):
+	}
+
+	// closing the stream should unblock the Write
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- s.Close() }()
+
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("expected Write to return an error after Close")
+		}
+		t.Log("Write returned:", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write was not unblocked by Close")
+	}
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal("Close failed:", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return")
+	}
+}
+
 func BenchmarkPackets(b *testing.B) {
 	for _, packetSize := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20} {
 		b.Run(fmt.Sprintf("%dx%d", ipv6MTU, packetSize), func(b *testing.B) {
