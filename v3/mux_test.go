@@ -1148,28 +1148,25 @@ func TestCloseAfterTimeout(t *testing.T) {
 }
 
 // TestCloseUnblocksWrite verifies that closing a Stream (or cancelling its
-// context) unblocks a Write that has stalled because the peer never reads: the
-// peer's readLoop parks in consumeFrame, TCP backpressure blocks the sender's
-// writeLoop, and Write ends up waiting in bufferFrame for buffer space that
-// never frees up.
+// context) unblocks a Write that has stalled on backpressure: the writeLoop
+// blocks on conn.Write, writeBuf fills up, and Write ends up waiting in
+// bufferFrame for buffer space that never frees up.
 func TestCloseUnblocksWrite(t *testing.T) {
-	if testing.Short() {
-		t.SkipNow()
-	}
-
-	// blockedWrite dials a stream whose peer never reads, starts a 4 MiB
-	// Write, and returns once the Write has stalled on backpressure.
+	// blockedWrite dials a stream on a mux whose conn blocks all writes,
+	// starts a 4 MiB Write, and returns once the Write has stalled in
+	// bufferFrame.
 	blockedWrite := func(t *testing.T, dial func(*Mux) *Stream) (*Stream, chan error) {
 		t.Helper()
-		m1, m2 := newTestingPair(t)
-
-		// the receiver accepts the stream but never reads from it
-		unblockServer := make(chan struct{})
-		t.Cleanup(func() { close(unblockServer) })
-		_ = handleStreams(m2, func(s *Stream) error {
-			<-unblockServer
-			return nil
+		var bc *blockConn
+		m1, _ := newTestingPairCustom(t, func(conn net.Conn) net.Conn {
+			bc = newBlockConn(conn)
+			return bc
 		})
+		t.Cleanup(func() { bc.Close() }) // unblock writes so cleanup doesn't hang
+
+		// block writes so the writeLoop stalls on conn.Write and writeBuf
+		// fills up
+		close(bc.blockCh)
 
 		s := dial(m1)
 		writeDone := make(chan error, 1)
@@ -1178,11 +1175,18 @@ func TestCloseUnblocksWrite(t *testing.T) {
 			writeDone <- err
 		}()
 
-		// after 1 second the Write should still be blocked on backpressure
+		// wait for the writeLoop to block on conn.Write
+		select {
+		case <-bc.blockedCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for conn.Write to block")
+		}
+
+		// the Write should stall in bufferFrame once writeBuf refills
 		select {
 		case err := <-writeDone:
 			t.Fatalf("Write returned before it was unblocked: %v", err)
-		case <-time.After(time.Second):
+		case <-time.After(100 * time.Millisecond):
 		}
 		return s, writeDone
 	}
