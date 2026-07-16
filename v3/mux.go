@@ -129,7 +129,16 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 		buf = &m.covertBuf
 		maxBufSize = m.settings.maxPayloadSize() * 2
 	}
-	for len(*buf)+frameHeaderSize+len(payload) > maxBufSize && m.err == nil && (deadline.IsZero() || time.Now().Before(deadline)) {
+	streamErr := func() error {
+		if h.flags&flagLast != 0 {
+			// last frame can be sent even if the stream is closed
+			return nil
+		}
+		s.cond.L.Lock()
+		defer s.cond.L.Unlock()
+		return s.err
+	}
+	for len(*buf)+frameHeaderSize+len(payload) > maxBufSize && m.err == nil && streamErr() == nil && (deadline.IsZero() || time.Now().Before(deadline)) {
 		m.bufferCond.Wait()
 	}
 	if m.err != nil {
@@ -465,12 +474,17 @@ func (m *Mux) DialStreamContext(ctx context.Context) *Stream {
 	go func() {
 		<-ctx.Done()
 		s.cond.L.Lock()
-		defer s.cond.L.Unlock()
 		if ctx.Err() != nil && s.err == nil {
 			s.err = ctx.Err()
 			s.readBuf = nil
 			s.cond.Broadcast()
 		}
+		s.cond.L.Unlock()
+
+		// wake any Write blocked in bufferFrame so it can observe s.err
+		m.mu.Lock()
+		m.bufferCond.Broadcast()
+		m.mu.Unlock()
 	}()
 	return s
 }
@@ -603,10 +617,12 @@ func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
 		s.cond.Broadcast() // wake Read
 		s.cond.L.Unlock()
 
-		// delete stream from Mux
+		// delete stream from Mux and wake any Write blocked in bufferFrame so
+		// it can observe s.err
 		s.m.mu.Lock()
 		delete(s.m.streams, s.id)
 		delete(s.m.closingStreams, s.id) // in case we had already closed it on our end
+		s.m.bufferCond.Broadcast()
 		s.m.mu.Unlock()
 		return
 	}
@@ -713,6 +729,11 @@ func (s *Stream) Close() error {
 	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
+
+	// wake any Write blocked in bufferFrame so it can observe s.err
+	s.m.mu.Lock()
+	s.m.bufferCond.Broadcast()
+	s.m.mu.Unlock()
 
 	// if the stream was never established (no frames were sent to the peer),
 	// don't send a flagLast frame since the peer doesn't know about this stream

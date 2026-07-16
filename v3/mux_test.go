@@ -1147,61 +1147,91 @@ func TestCloseAfterTimeout(t *testing.T) {
 	}
 }
 
-// TestCloseUnblocksWrite verifies that closing a Stream unblocks a Write that
-// has stalled because the peer never reads: the peer's readLoop parks in
-// consumeFrame, TCP backpressure blocks the sender's writeLoop, and Write ends
-// up waiting in bufferFrame for buffer space that never frees up.
+// TestCloseUnblocksWrite verifies that closing a Stream (or cancelling its
+// context) unblocks a Write that has stalled because the peer never reads: the
+// peer's readLoop parks in consumeFrame, TCP backpressure blocks the sender's
+// writeLoop, and Write ends up waiting in bufferFrame for buffer space that
+// never frees up.
 func TestCloseUnblocksWrite(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
 
-	m1, m2 := newTestingPair(t)
+	// blockedWrite dials a stream whose peer never reads, starts a 4 MiB
+	// Write, and returns once the Write has stalled on backpressure.
+	blockedWrite := func(t *testing.T, dial func(*Mux) *Stream) (*Stream, chan error) {
+		t.Helper()
+		m1, m2 := newTestingPair(t)
 
-	// the receiver accepts the stream but never reads from it
-	unblockServer := make(chan struct{})
-	defer close(unblockServer)
-	_ = handleStreams(m2, func(s *Stream) error {
-		<-unblockServer
-		return nil
+		// the receiver accepts the stream but never reads from it
+		unblockServer := make(chan struct{})
+		t.Cleanup(func() { close(unblockServer) })
+		_ = handleStreams(m2, func(s *Stream) error {
+			<-unblockServer
+			return nil
+		})
+
+		s := dial(m1)
+		writeDone := make(chan error, 1)
+		go func() {
+			_, err := s.Write(make([]byte, 4<<20))
+			writeDone <- err
+		}()
+
+		// after 1 second the Write should still be blocked on backpressure
+		select {
+		case err := <-writeDone:
+			t.Fatalf("Write returned before it was unblocked: %v", err)
+		case <-time.After(time.Second):
+		}
+		return s, writeDone
+	}
+
+	waitWrite := func(t *testing.T, writeDone chan error, want error) {
+		t.Helper()
+		select {
+		case err := <-writeDone:
+			if !errors.Is(err, want) {
+				t.Fatalf("expected %v from Write, got %v", want, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Write was not unblocked")
+		}
+	}
+
+	t.Run("close", func(t *testing.T) {
+		s, writeDone := blockedWrite(t, (*Mux).DialStream)
+
+		// closing the stream should unblock the Write
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- s.Close() }()
+
+		waitWrite(t, writeDone, ErrClosedStream)
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatal("Close failed:", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close did not return")
+		}
 	})
 
-	s := m1.DialStream()
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := s.Write(make([]byte, 4<<20))
-		writeDone <- err
-	}()
+	t.Run("context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		s, writeDone := blockedWrite(t, func(m *Mux) *Stream {
+			return m.DialStreamContext(ctx)
+		})
 
-	// after 1 second the Write should still be blocked on backpressure
-	select {
-	case err := <-writeDone:
-		t.Fatalf("Write returned before Close was called: %v", err)
-	case <-time.After(time.Second):
-	}
+		// cancelling the context should unblock the Write
+		cancel()
+		waitWrite(t, writeDone, context.Canceled)
 
-	// closing the stream should unblock the Write
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- s.Close() }()
-
-	select {
-	case err := <-writeDone:
-		if err == nil {
-			t.Fatal("expected Write to return an error after Close")
-		}
-		t.Log("Write returned:", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Write was not unblocked by Close")
-	}
-
-	select {
-	case err := <-closeDone:
-		if err != nil {
+		if err := s.Close(); err != nil {
 			t.Fatal("Close failed:", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return")
-	}
+	})
 }
 
 func BenchmarkPackets(b *testing.B) {
