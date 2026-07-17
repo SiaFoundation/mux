@@ -673,19 +673,19 @@ func (s *Stream) Read(p []byte) (int, error) {
 }
 
 // Write writes data to the Stream.
-func (s *Stream) Write(p []byte) (int, error) {
+func (s *Stream) Write(p []byte) (n int, err error) {
 	buf := bytes.NewBuffer(p)
 	for buf.Len() > 0 {
 		// check for error
 		s.cond.L.Lock()
-		err := s.err
+		err = s.err
 		var flags uint16
 		if err == nil && !s.established {
 			flags = flagFirst
 		}
 		s.cond.L.Unlock()
 		if err != nil {
-			return len(p) - buf.Len(), err
+			return
 		}
 		// write next frame's worth of data
 		payload := buf.Next(s.m.settings.maxPayloadSize())
@@ -696,10 +696,11 @@ func (s *Stream) Write(p []byte) (int, error) {
 		}
 		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
 		if err != nil {
-			return len(p) - buf.Len(), err
+			return
 		}
+		n += len(payload)
 	}
-	return len(p), nil
+	return
 }
 
 // Close closes the Stream. The underlying connection is not closed.
