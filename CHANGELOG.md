@@ -1,3 +1,10 @@
+## 1.5.3 (2026-07-17)
+
+### Fixes
+
+- Fix Stream.Write not getting unblocked by Stream.Close if writeBuf is full.
+- Short-circuits readLoop if an error occurs before Stream creation
+
 ## 1.5.2 (2026-06-09)
 
 ### Fixes
