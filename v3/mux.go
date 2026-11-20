@@ -31,18 +31,31 @@ var (
 	ErrStreamFlood      = errors.New("too many frames received for closed stream")
 	ErrUnknownStream    = errors.New("frame received for unknown stream")
 	ErrInactiveConn     = errors.New("connection closed due to inactivity")
+	ErrWriteBacklog     = errors.New("too many frames buffered for a peer that is not reading")
 )
 
 const (
 	// closingStreamCleanupInterval is the time after which a closed stream will
 	// no longer be tracked as closing. After that time, receiving a frame for
-	// that stream will lead to an immediate closure of the mux.
+	// that stream will lead to an immediate closure of the mux. It is measured
+	// with m.readClock, so time that readLoop spends blocked in consumeFrame
+	// does not count. Time that the peer's readLoop spends blocked (delaying
+	// its receipt of our flagLast frame) still counts.
 	closingStreamCleanupInterval = time.Minute
 
 	// maxClosedFrames is the maximum number of frames to accept for a closed
 	// stream before we consider the peer to be acting maliciously and close the
 	// mux.
 	maxClosedFrames = 1000 // ~4MiB on default settings
+
+	// maxStreams is the maximum number of open and closing streams. The peer
+	// cannot open a stream beyond it.
+	maxStreams = 1 << 20
+
+	// maxQueuedCloseFrames is the number of flagLast frames that Close may
+	// buffer beyond the size that bufferFrame fills a buffer to. Close closes
+	// the mux with ErrWriteBacklog rather than exceed it.
+	maxQueuedCloseFrames = 1 << 16 // 512KiB
 
 	// maxKeepalives is the maximum number of consecutive keepalives to send
 	// without any other traffic before closing the mux.
@@ -51,15 +64,16 @@ const (
 
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
 type Mux struct {
-	conn     net.Conn
-	cipher   *seqCipher
-	settings connSettings
+	conn      net.Conn
+	cipher    *seqCipher
+	settings  connSettings
+	readClock readClock
 
 	// all subsequent fields are guarded by mu
 	mu             sync.Mutex
 	cond           sync.Cond
 	streams        map[uint32]*Stream
-	closingStreams map[uint32]closingStream // streams closed by us
+	closingStreams map[uint32]closingStream // streams closed by us or by the peer
 	nextID         uint32
 	remKeepalives  int
 	err            error // sticky and fatal
@@ -68,13 +82,63 @@ type Mux struct {
 	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
-// closingStream is used to track streams that have been closed by us until either
-// - the peer acknowledges the closure by sending a frame with flagLast
+// closingStream is used to track streams that have been closed, by us or by
+// the peer, until either
 // - frameCount exceeds maxClosedFrames
 // - closingStreamCleanupInterval has passed
+//
+// Frames that arrive for a closing stream are discarded.
 type closingStream struct {
 	frameCount uint16
-	closed     time.Time
+	closed     time.Duration // m.readClock time
+}
+
+// addClosingStream starts tracking id as closing. The caller must hold m.mu.
+func (m *Mux) addClosingStream(id uint32) {
+	m.closingStreams[id] = closingStream{closed: m.readClock.now()}
+}
+
+// A readClock measures time during which readLoop is not blocked in
+// consumeFrame. While readLoop is blocked, the peer's frames queue up behind
+// it, so only time on this clock bounds how long a frame can have been in
+// flight.
+//
+// pause and resume are only called by readLoop; now may be called
+// concurrently with them.
+type readClock struct {
+	epoch time.Time
+
+	mu         sync.Mutex
+	paused     bool
+	pausedAt   time.Duration // clock time when the current pause began
+	pauseTotal time.Duration // total length of completed pauses
+}
+
+// pause stops the clock while readLoop is blocked in consumeFrame.
+func (c *readClock) pause() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pausedAt = time.Since(c.epoch) - c.pauseTotal
+	c.paused = true
+}
+
+// resume restarts the clock once consumeFrame returns.
+func (c *readClock) resume() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pauseTotal = time.Since(c.epoch) - c.pausedAt
+	c.paused = false
+}
+
+// now returns the time elapsed since epoch, excluding time readLoop has spent
+// blocked in consumeFrame.
+func (c *readClock) now() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.paused {
+		return c.pausedAt
+	}
+	return time.Since(c.epoch) - c.pauseTotal
 }
 
 // setErr sets the Mux error and wakes up all Mux-related goroutines. If m.err
@@ -82,6 +146,11 @@ type closingStream struct {
 func (m *Mux) setErr(err error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.setErrLocked(err)
+}
+
+// setErrLocked is like setErr, but the caller must hold m.mu.
+func (m *Mux) setErrLocked(err error) error {
 	if m.err != nil {
 		return m.err
 	}
@@ -106,13 +175,22 @@ func (m *Mux) setErr(err error) error {
 	return err
 }
 
-// bufferFrame blocks until it can store its frame in m.writeBuf (or, for covert
-// streams, m.covertBuf). It returns early with an error if m.err is set, if
-// s.err is set (unless the frame itself is flagLast), or if the deadline
-// expires. Re-checking s.err under m.mu is what guarantees that once Close
-// has queued its flagLast frame, no further frames for the same stream can
-// be queued behind it.
-func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline time.Time, covert bool) error {
+// writeBufFor returns the buffer that frames for a regular or covert stream are
+// stored in, and the size up to which bufferFrame fills it. The caller must
+// hold m.mu.
+func (m *Mux) writeBufFor(covert bool) (buf *[]byte, maxBufSize int) {
+	if covert {
+		return &m.covertBuf, m.settings.maxPayloadSize() * 2
+	}
+	return &m.writeBuf, m.settings.maxPayloadSize() * 10
+}
+
+// bufferFrame blocks until it can store a frame for s in m.writeBuf (or, for
+// covert streams, m.covertBuf). It returns early with an error if m.err or
+// s.err is set, or if the deadline expires. Close sets s.err under m.mu, so
+// re-checking s.err under m.mu guarantees that no frame can be buffered behind
+// the stream's flagLast frame.
+func (m *Mux) bufferFrame(s *Stream, payload []byte, deadline time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !deadline.IsZero() {
@@ -123,17 +201,8 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 		defer timer.Stop()
 	}
 	// block until we can add the frame to the buffer
-	buf := &m.writeBuf
-	maxBufSize := m.settings.maxPayloadSize() * 10
-	if covert {
-		buf = &m.covertBuf
-		maxBufSize = m.settings.maxPayloadSize() * 2
-	}
+	buf, maxBufSize := m.writeBufFor(s.covert)
 	streamErr := func() error {
-		if h.flags&flagLast != 0 {
-			// last frame can be sent even if the stream is closed
-			return nil
-		}
 		s.cond.L.Lock()
 		defer s.cond.L.Unlock()
 		return s.err
@@ -147,27 +216,22 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 		return os.ErrDeadlineExceeded
 	}
 
-	// if this is a normal frame, check for stream error. Upon Close, the
-	// stream's error is set to ErrClosedStream. After that, the only frame that
-	// we allow to be sent is a flagLast frame. For flagFirst, also set
-	// s.established under the same lock, otherwise a racing Close can skip
-	// flagLast and leave the peer with a phantom stream.
-	if h.flags&flagLast == 0 {
-		s.cond.L.Lock()
-		if s.err != nil {
-			s.cond.L.Unlock()
-			// we aren't appending, so we wake up the next bufferFrame call
-			// which might be able to append to the buffer now.
-			m.bufferCond.Signal()
-			return s.err
-		}
-		if h.flags&flagFirst != 0 {
-			s.established = true
-		}
+	// check for stream error, and set flagFirst under the same lock so that
+	// concurrent Writes establish the stream exactly once
+	h := frameHeader{id: s.id, length: uint16(len(payload))}
+	s.cond.L.Lock()
+	if err := s.err; err != nil {
 		s.cond.L.Unlock()
+		m.bufferCond.Signal()
+		return err
 	}
+	if !s.established {
+		h.flags = flagFirst
+		s.established = true
+	}
+	s.cond.L.Unlock()
 
-	// queue our frame and wake the writeLoop
+	// buffer our frame and wake the writeLoop
 	//
 	// NOTE: it is not necessary to wait for the writeLoop to flush our frame.
 	// After all, a successful write() syscall doesn't mean that the peer
@@ -176,7 +240,7 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 	*buf = appendFrame(*buf, h, payload)
 	m.cond.Broadcast()
 
-	if covert {
+	if s.covert {
 		// wake all other bufferFrame calls
 		//
 		// NOTE: this causes lots of spurious wakeups. Covert bandwidth is
@@ -241,11 +305,8 @@ func (m *Mux) writeLoop() {
 		// pad to packet boundary
 		if len(m.writeBuf)%m.settings.maxFrameSize() != 0 {
 			padding := m.settings.maxFrameSize() - len(m.writeBuf)%m.settings.maxFrameSize()
-			m.writeBuf = m.writeBuf[:len(m.writeBuf)+padding]
+			m.writeBuf = append(m.writeBuf, make([]byte, padding)...)
 			pad := m.writeBuf[len(m.writeBuf)-padding:]
-			for i := range pad {
-				pad[i] = 0
-			}
 			// replace padding with covert data, if available
 			if len(m.covertBuf) > 0 && len(pad) > 1 {
 				pad[0] = 0b10 // sentinel byte; see packetReader
@@ -254,6 +315,12 @@ func (m *Mux) writeLoop() {
 			}
 		}
 		// split into packets and encrypt
+		//
+		// NOTE: Close appends flagLast frames without waiting for buffer
+		// space, so writeBuf can exceed the size bufferFrame allows
+		if n := len(m.writeBuf) / m.settings.maxFrameSize() * m.settings.PacketSize; n > len(buf) {
+			buf = make([]byte, n)
+		}
 		packets := encryptPackets(buf, m.writeBuf, m.settings.PacketSize, m.cipher)
 
 		// clear writeBuf and wake at most one bufferFrame call
@@ -277,8 +344,9 @@ func (m *Mux) writeLoop() {
 func (m *Mux) pruneClosedStreams() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.readClock.now()
 	for id, cs := range m.closingStreams {
-		if time.Since(cs.closed) > closingStreamCleanupInterval {
+		if now-cs.closed > closingStreamCleanupInterval {
 			delete(m.closingStreams, id)
 		}
 	}
@@ -335,41 +403,47 @@ func (m *Mux) readLoop() {
 		}
 
 		// look for matching Stream
-		var stream *Stream
+		//
+		// NOTE: this must happen under m.mu so that it agrees with Close about
+		// whether we have closed the stream
 		m.mu.Lock()
 		m.remKeepalives = maxKeepalives
-		if s := m.streams[h.id]; s != nil {
-			stream = s
-		} else {
-			if h.flags&flagFirst == 0 {
-				cs, ok := m.closingStreams[h.id]
-				if ok {
-					// we are encountering a frame for a stream that has already
-					// been closed. This could be a delayed frame, or it could be an
-					// attempt to flood us with garbage frames. Track how many frames
-					// we've seen for this closed stream, and if it exceeds the threshold,
-					// close the mux
-					cs.frameCount++
-					m.closingStreams[h.id] = cs
-					if cs.frameCount >= maxClosedFrames {
-						m.mu.Unlock()
-						m.setErr(ErrStreamFlood)
-						return
-					}
+		stream := m.streams[h.id]
+		if stream == nil {
+			if cs, ok := m.closingStreams[h.id]; ok {
+				// we are encountering a frame for a stream that has already
+				// been closed. This could be a delayed frame, or it could be
+				// an attempt to flood us with garbage frames. Track how many
+				// frames we've seen for this closed stream, and if it exceeds
+				// the threshold, close the mux
+				//
+				// NOTE: this applies even if the frame has flagFirst set.
+				// Peers running older versions of this package can set
+				// flagFirst on more than one frame when Writes race, and such
+				// a frame must not reopen the stream.
+				cs.frameCount++
+				m.closingStreams[h.id] = cs
+				if cs.frameCount >= maxClosedFrames {
 					m.mu.Unlock()
-				} else {
-					// received a frame for a stream that we don't know at all
-					m.mu.Unlock()
-					m.setErr(ErrUnknownStream)
+					m.setErr(ErrStreamFlood)
 					return
 				}
+				m.mu.Unlock()
 				continue
 			}
-			// create a new stream
-			const maxStreams = 1 << 20
-			if len(m.streams) > maxStreams {
+			if h.flags&flagFirst == 0 {
+				// received a frame for a stream that we don't know at all
 				m.mu.Unlock()
-				m.setErr(fmt.Errorf("exceeded concurrent stream limit (%v streams)", maxStreams))
+				m.setErr(fmt.Errorf("%w (%v) (covert=%v, length=%v, flags=%v)", ErrUnknownStream, h.id, covert, h.length, h.flags))
+				return
+			}
+			// create a new stream
+			//
+			// NOTE: closing streams count toward the limit, so that opening
+			// and closing streams cannot grow m.closingStreams without bound
+			if len(m.streams)+len(m.closingStreams) >= maxStreams {
+				m.mu.Unlock()
+				m.setErr(fmt.Errorf("exceeded stream limit (%v open or closing streams)", maxStreams))
 				return
 			}
 			// If the mux is already dying, do not register a new stream.
@@ -388,9 +462,35 @@ func (m *Mux) readLoop() {
 			m.streams[h.id] = stream
 			m.cond.Broadcast() // wake (*Mux).AcceptStream
 		}
+		if h.flags&flagLast != 0 {
+			m.peerClosedStream(stream, h, payload)
+			m.mu.Unlock()
+			continue
+		}
 		m.mu.Unlock()
-		stream.consumeFrame(h, payload)
+		m.readClock.pause()
+		stream.consumeFrame(payload)
+		m.readClock.resume()
 	}
+}
+
+// peerClosedStream handles a flagLast frame for a stream that we have not
+// closed. The stream is tracked as closing, because peers running older
+// versions of this package can send frames after their flagLast frame. The
+// caller must hold m.mu.
+func (m *Mux) peerClosedStream(s *Stream, h frameHeader, payload []byte) {
+	err := ErrPeerClosedStream
+	if h.flags&flagError != 0 {
+		err = errors.New(string(payload))
+	}
+	s.cond.L.Lock()
+	s.err = err
+	s.cond.Broadcast() // wake Read
+	s.cond.L.Unlock()
+
+	delete(m.streams, s.id)
+	m.addClosingStream(s.id)
+	m.bufferCond.Broadcast() // wake Write so it can observe s.err
 }
 
 // Close closes the underlying net.Conn.
@@ -496,6 +596,7 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 		cipher:         cipher,
 		closingStreams: make(map[uint32]closingStream),
 		settings:       settings,
+		readClock:      readClock{epoch: time.Now()},
 		streams:        make(map[uint32]*Stream),
 		nextID:         idLowestStream,
 		remKeepalives:  maxKeepalives,
@@ -605,27 +706,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // consumeFrame stores a frame in s.readBuf and waits for it to be consumed by
 // (*Stream).Read calls.
-func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
-	if h.flags&flagLast != 0 {
-		// stream is closing; set s.err
-		err := ErrPeerClosedStream
-		if h.flags&flagError != 0 {
-			err = errors.New(string(payload))
-		}
-		s.cond.L.Lock()
-		s.err = err
-		s.cond.Broadcast() // wake Read
-		s.cond.L.Unlock()
-
-		// delete stream from Mux and wake any Write blocked in bufferFrame so
-		// it can observe s.err
-		s.m.mu.Lock()
-		delete(s.m.streams, s.id)
-		delete(s.m.closingStreams, s.id) // in case we had already closed it on our end
-		s.m.bufferCond.Broadcast()
-		s.m.mu.Unlock()
-		return
-	}
+func (s *Stream) consumeFrame(payload []byte) {
 	// set payload and wait for it to be consumed
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
@@ -679,22 +760,14 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		// check for error
 		s.cond.L.Lock()
 		err = s.err
-		var flags uint16
-		if err == nil && !s.established {
-			flags = flagFirst
-		}
+		deadline := s.wd
 		s.cond.L.Unlock()
 		if err != nil {
 			return
 		}
 		// write next frame's worth of data
 		payload := buf.Next(s.m.settings.maxPayloadSize())
-		h := frameHeader{
-			id:     s.id,
-			length: uint16(len(payload)),
-			flags:  flags,
-		}
-		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
+		err = s.m.bufferFrame(s, payload, deadline)
 		if err != nil {
 			return
 		}
@@ -704,58 +777,55 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 }
 
 // Close closes the Stream. The underlying connection is not closed.
+//
+// Close does not block, even if the write buffer is full; the flagLast frame
+// is sent after any frames already buffered for the Stream. If too many
+// flagLast frames are already waiting for a peer that is not reading, Close
+// closes the Mux and returns ErrWriteBacklog. If the peer has already closed
+// the Stream, Close returns nil, sends nothing, and
+// the Stream keeps the error the peer closed it with.
 func (s *Stream) Close() error {
-	// always delete stream from Mux after closing it
-	defer func() {
-		s.m.mu.Lock()
-		delete(s.m.streams, s.id)
-		s.m.closingStreams[s.id] = closingStream{
-			closed: time.Now(),
-		}
-		s.m.mu.Unlock()
-	}()
-
-	// cancel outstanding Read/Write calls
-	//
-	// NOTE: Read calls will be interrupted immediately, but Write calls might
-	// send another frame before observing the Close. This is ok: the peer will
-	// discard any frames that arrive after the flagLast frame.
-	s.cond.L.Lock()
-	if s.err == ErrClosedStream || s.err == ErrPeerClosedStream {
-		s.cond.L.Unlock()
+	s.m.mu.Lock()
+	defer s.m.mu.Unlock()
+	// only the first Close of a stream that is still open does anything; the
+	// peer may already have closed it
+	if s.m.streams[s.id] != s {
 		return nil
 	}
+	delete(s.m.streams, s.id)
+
+	s.cond.L.Lock()
 	s.err = ErrClosedStream
 	established := s.established
 	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
+	s.m.bufferCond.Broadcast() // wake Write so it can observe s.err
 
-	// wake any Write blocked in bufferFrame so it can observe s.err
-	s.m.mu.Lock()
-	s.m.bufferCond.Broadcast()
-	s.m.mu.Unlock()
-
-	// if the stream was never established (no frames were sent to the peer),
-	// don't send a flagLast frame since the peer doesn't know about this stream
-	// and would treat it as an error.
 	if !established {
+		// if the stream was never established (no frames were sent to the
+		// peer), don't send a flagLast frame since the peer doesn't know
+		// about this stream and would treat it as an error.
 		return nil
+	} else if s.m.err != nil {
+		return s.m.err
 	}
 
-	h := frameHeader{
-		id:    s.id,
-		flags: flagLast,
+	// buffer the flagLast frame without waiting for buffer space; it follows
+	// any frames already buffered for the stream. The stream is tracked as
+	// closing right away, so frames the peer sends meanwhile are discarded.
+	//
+	// NOTE: closing streams are pruned even while the writeLoop is blocked, so
+	// without a budget, a peer that stops reading but keeps opening streams
+	// for us to close could grow the buffer without bound. Dropping the
+	// flagLast frame instead would leave the peer with a phantom stream.
+	buf, maxBufSize := s.m.writeBufFor(s.covert)
+	if len(*buf)+frameHeaderSize > maxBufSize+maxQueuedCloseFrames*frameHeaderSize {
+		return s.m.setErrLocked(ErrWriteBacklog)
 	}
-
-	// normally, we use s.wd as the deadline when sending frames, but in this
-	// case, it's possible that we're closing because s.wd expired. So to
-	// prevent bufferFrame from failing immediately, we use an explicit
-	// deadline.
-	err := s.m.bufferFrame(s, h, nil, time.Now().Add(10*time.Second), s.covert)
-	if err != nil && err != ErrPeerClosedStream && err != ErrClosedStream {
-		return err
-	}
+	*buf = appendFrame(*buf, frameHeader{id: s.id, flags: flagLast}, nil)
+	s.m.addClosingStream(s.id)
+	s.m.cond.Broadcast() // wake writeLoop
 	return nil
 }
 

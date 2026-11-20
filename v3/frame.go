@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 )
 
 const (
@@ -45,6 +46,7 @@ func decodeFrameHeader(buf []byte) (h frameHeader) {
 }
 
 func appendFrame(buf []byte, h frameHeader, payload []byte) []byte {
+	buf = slices.Grow(buf, frameHeaderSize+len(payload))
 	frame := buf[len(buf):][:frameHeaderSize+len(payload)]
 	encodeFrameHeader(frame[:frameHeaderSize], h)
 	copy(frame[frameHeaderSize:], payload)
