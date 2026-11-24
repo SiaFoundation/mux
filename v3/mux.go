@@ -77,6 +77,11 @@ type closingStream struct {
 	closed     time.Time
 }
 
+// addClosingStream starts tracking id as closing. The caller must hold m.mu.
+func (m *Mux) addClosingStream(id uint32) {
+	m.closingStreams[id] = closingStream{closed: time.Now()}
+}
+
 // setErr sets the Mux error and wakes up all Mux-related goroutines. If m.err
 // is already set, setErr is a no-op.
 func (m *Mux) setErr(err error) error {
@@ -337,6 +342,9 @@ func (m *Mux) readLoop() {
 		}
 
 		// look for matching Stream
+		//
+		// NOTE: this must happen under m.mu so that it agrees with Close about
+		// whether we have closed the stream
 		m.mu.Lock()
 		m.remKeepalives = maxKeepalives
 		stream := m.streams[h.id]
@@ -391,9 +399,30 @@ func (m *Mux) readLoop() {
 			m.streams[h.id] = stream
 			m.cond.Broadcast() // wake (*Mux).AcceptStream
 		}
+		if h.flags&flagLast != 0 {
+			m.peerClosedStream(stream, h, payload)
+			m.mu.Unlock()
+			continue
+		}
 		m.mu.Unlock()
-		stream.consumeFrame(h, payload)
+		stream.consumeFrame(payload)
 	}
+}
+
+// peerClosedStream handles a flagLast frame for a stream that we have not
+// closed. The caller must hold m.mu.
+func (m *Mux) peerClosedStream(s *Stream, h frameHeader, payload []byte) {
+	err := ErrPeerClosedStream
+	if h.flags&flagError != 0 {
+		err = errors.New(string(payload))
+	}
+	s.cond.L.Lock()
+	s.err = err
+	s.cond.Broadcast() // wake Read
+	s.cond.L.Unlock()
+
+	delete(m.streams, s.id)
+	m.bufferCond.Broadcast() // wake Write so it can observe s.err
 }
 
 // Close closes the underlying net.Conn.
@@ -608,27 +637,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 
 // consumeFrame stores a frame in s.readBuf and waits for it to be consumed by
 // (*Stream).Read calls.
-func (s *Stream) consumeFrame(h frameHeader, payload []byte) {
-	if h.flags&flagLast != 0 {
-		// stream is closing; set s.err
-		err := ErrPeerClosedStream
-		if h.flags&flagError != 0 {
-			err = errors.New(string(payload))
-		}
-		s.cond.L.Lock()
-		s.err = err
-		s.cond.Broadcast() // wake Read
-		s.cond.L.Unlock()
-
-		// delete stream from Mux and wake any Write blocked in bufferFrame so
-		// it can observe s.err
-		s.m.mu.Lock()
-		delete(s.m.streams, s.id)
-		delete(s.m.closingStreams, s.id) // in case we had already closed it on our end
-		s.m.bufferCond.Broadcast()
-		s.m.mu.Unlock()
-		return
-	}
+func (s *Stream) consumeFrame(payload []byte) {
 	// set payload and wait for it to be consumed
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
@@ -703,44 +712,39 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 }
 
 // Close closes the Stream. The underlying connection is not closed.
+//
+// If the peer has already closed the Stream, Close returns nil, sends nothing,
+// and the Stream keeps the error the peer closed it with.
 func (s *Stream) Close() error {
-	// always delete stream from Mux after closing it
-	defer func() {
-		s.m.mu.Lock()
-		delete(s.m.streams, s.id)
-		s.m.closingStreams[s.id] = closingStream{
-			closed: time.Now(),
-		}
+	s.m.mu.Lock()
+	// only the first Close of a stream that is still open does anything; the
+	// peer may already have closed it
+	if s.m.streams[s.id] != s {
 		s.m.mu.Unlock()
-	}()
-
-	// cancel outstanding Read/Write calls
-	//
-	// NOTE: Read calls will be interrupted immediately, but Write calls might
-	// send another frame before observing the Close. This is ok: the peer will
-	// discard any frames that arrive after the flagLast frame.
-	s.cond.L.Lock()
-	if s.err == ErrClosedStream || s.err == ErrPeerClosedStream {
-		s.cond.L.Unlock()
 		return nil
 	}
+	delete(s.m.streams, s.id)
+
+	// cancel outstanding Read/Write calls
+	s.cond.L.Lock()
 	s.err = ErrClosedStream
 	established := s.established
 	s.readBuf = nil
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
+	s.m.bufferCond.Broadcast() // wake Write so it can observe s.err
 
-	// wake any Write blocked in bufferFrame so it can observe s.err
-	s.m.mu.Lock()
-	s.m.bufferCond.Broadcast()
-	s.m.mu.Unlock()
-
-	// if the stream was never established (no frames were sent to the peer),
-	// don't send a flagLast frame since the peer doesn't know about this stream
-	// and would treat it as an error.
 	if !established {
+		// if the stream was never established (no frames were sent to the
+		// peer), don't send a flagLast frame since the peer doesn't know
+		// about this stream and would treat it as an error.
+		s.m.mu.Unlock()
 		return nil
 	}
+	// the stream is tracked as closing right away, so frames the peer sends
+	// meanwhile are discarded
+	s.m.addClosingStream(s.id)
+	s.m.mu.Unlock()
 
 	h := frameHeader{
 		id:    s.id,

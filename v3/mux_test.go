@@ -943,6 +943,30 @@ func TestCloseUnestablishedStreamRace(t *testing.T) {
 	}
 }
 
+// TestCloseAfterPeerError ensures that closing a Stream that the peer has
+// already closed with an error succeeds and keeps the peer's error.
+func TestCloseAfterPeerError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+
+		peer.writeFrames(t, encodeFrame(idLowestStream+1, flagFirst, 1))
+		s, err := m.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		} else if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+
+		peer.writeFrames(t, encodeFrame(s.id, flagLast|flagError, []byte("boom")...))
+		synctest.Wait() // let readLoop handle the frame
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		} else if _, err := s.Write([]byte{1}); err == nil || err.Error() != "boom" {
+			t.Fatalf("expected peer's error, got %v", err)
+		}
+	})
+}
+
 // TestCloseWriteRace ensures that concurrently calling Write and Close on the
 // same Stream never causes the peer mux to close with ErrUnknownStream.
 func TestCloseWriteRace(t *testing.T) {
