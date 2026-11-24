@@ -864,9 +864,11 @@ func TestFirstFrameAfterClose(t *testing.T) {
 	})
 }
 
-// TestCloseUnestablishedStream ensures that closing a Stream that was dialed
-// but never written to does not send a flagLast frame to the peer, which would
-// cause the peer mux to close with ErrUnknownStream.
+// TestCloseUnestablishedStream ensures that closing a Stream that was never
+// written to does not send a flagLast frame, which the peer would reject with
+// ErrUnknownStream, and that racing Write and Close on a freshly-dialed Stream
+// never leaves the peer with an orphaned stream: either no frames are sent at
+// all, or both flagFirst and flagLast are sent.
 func TestCloseUnestablishedStream(t *testing.T) {
 	m1, m2 := newTestingPair(t)
 
@@ -878,31 +880,6 @@ func TestCloseUnestablishedStream(t *testing.T) {
 	if err := m1.DialStream().Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
-
-	// no frames should have been sent to the peer
-	select {
-	case err := <-serverCh:
-		t.Fatalf("m2 closed unexpectedly: %v", err)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	if err := m1.Close(); err != nil {
-		t.Fatal(err)
-	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
-		t.Fatal(err)
-	}
-}
-
-// TestCloseUnestablishedStreamRace ensures that racing Write and Close on a
-// freshly-dialed Stream never leaves the peer with an orphaned stream: either
-// no frames are sent at all, or both flagFirst and flagLast are sent.
-func TestCloseUnestablishedStreamRace(t *testing.T) {
-	m1, m2 := newTestingPair(t)
-
-	serverCh := handleStreams(m2, func(s *Stream) error {
-		io.Copy(io.Discard, s)
-		return nil
-	})
 
 	const attempts = 500
 	for i := range attempts {
@@ -941,6 +918,30 @@ func TestCloseUnestablishedStreamRace(t *testing.T) {
 	} else if err := <-serverCh; err != nil && err != ErrPeerClosedConn {
 		t.Fatal(err)
 	}
+}
+
+// TestCloseAfterPeerError ensures that closing a Stream that the peer has
+// already closed with an error succeeds and keeps the peer's error.
+func TestCloseAfterPeerError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+
+		peer.writeFrames(t, encodeFrame(idLowestStream+1, flagFirst, 1))
+		s, err := m.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		} else if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+
+		peer.writeFrames(t, encodeFrame(s.id, flagLast|flagError, []byte("boom")...))
+		synctest.Wait() // let readLoop handle the frame
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		} else if _, err := s.Write([]byte{1}); err == nil || err.Error() != "boom" {
+			t.Fatalf("expected peer's error, got %v", err)
+		}
+	})
 }
 
 // TestCloseWriteRace ensures that concurrently calling Write and Close on the
@@ -1308,8 +1309,82 @@ func TestCloseAfterTimeout(t *testing.T) {
 	}
 }
 
-// TestCloseUnblocksWrite verifies that closing a Stream (or cancelling its
-// context) unblocks a Write that has stalled on backpressure: the writeLoop
+// TestCloseWithFullBuffer ensures that Close does not block when the write
+// buffer is full, and that once the peer resumes reading, every closed stream
+// sends its frames followed by exactly one flagLast frame, in close order.
+func TestCloseWithFullBuffer(t *testing.T) {
+	tests := []struct {
+		name    string
+		dial    func(*Mux) *Stream
+		streams int
+	}{
+		{"regular", (*Mux).DialStream, 20},
+		{"covert", (*Mux).DialCovertStream, 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				m, peer := newPipeMux(t)
+				buf := make([]byte, m.settings.maxPayloadSize())
+
+				// background stream, to block the writeLoop before filling
+				// either buffer
+				bs := blockWriteLoop(t, m)
+				payload := bytes.Repeat([]byte{42}, m.settings.maxPayloadSize()/2-frameHeaderSize)
+				streams := make([]*Stream, test.streams)
+				expFlags := make(map[uint32]uint16)
+				for i := range streams {
+					streams[i] = test.dial(m)
+					if _, err := streams[i].Write(payload); err != nil {
+						t.Fatal(err)
+					}
+					expFlags[streams[i].id] = flagFirst
+				}
+				for _, s := range streams {
+					if err := s.Close(); err != nil {
+						t.Fatal(err)
+					} else if err := s.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// keepalives provide the padding for covert frames
+				var closed int
+				for len(expFlags) > 0 {
+					h, p, covert, err := peer.nextFrame(buf)
+					if err != nil {
+						t.Fatal(err)
+					} else if h.id == bs.id || h.id == idKeepalive {
+						continue
+					}
+					if flags, ok := expFlags[h.id]; !ok || h.flags != flags || covert != streams[0].covert {
+						t.Fatalf("unexpected frame %+v (covert=%v)", h, covert)
+					}
+					if h.flags == flagFirst {
+						if !bytes.Equal(p, payload) {
+							t.Fatal("incorrect stream payload")
+						}
+						expFlags[h.id] = flagLast
+					} else if h.id != streams[closed].id {
+						t.Fatalf("expected flagLast frame for stream %v (close order), got stream %v", streams[closed].id, h.id)
+					} else {
+						delete(expFlags, h.id)
+						closed++
+					}
+				}
+				if _, err := bs.Write([]byte{2}); err != nil {
+					t.Fatal(err)
+				}
+				h, p, _, err := peer.nextFrame(buf)
+				if err != nil || h.id != bs.id || !bytes.Equal(p, []byte{2}) {
+					t.Fatalf("expected background stream frame after flagLast frames, got %+v, %x, %v", h, p, err)
+				}
+			})
+		})
+	}
+}
+
+// TestCloseUnblocksWrite verifies that closing a Stream or its Mux (or
+// cancelling the Stream's context) returns immediately and unblocks a Write that has stalled on backpressure: the writeLoop
 // blocks on conn.Write, writeBuf fills up, and Write ends up waiting in
 // bufferFrame for buffer space that never frees up.
 func TestCloseUnblocksWrite(t *testing.T) {
@@ -1364,23 +1439,24 @@ func TestCloseUnblocksWrite(t *testing.T) {
 		}
 	}
 
-	t.Run("close", func(t *testing.T) {
-		s, writeDone := blockedWrite(t, (*Mux).DialStream)
-
-		// closing the stream should unblock the Write
-		closeDone := make(chan error, 1)
-		go func() { closeDone <- s.Close() }()
-
-		waitWrite(t, writeDone, ErrClosedStream)
-		select {
-		case err := <-closeDone:
-			if err != nil {
+	// closing the stream or the mux should return immediately and unblock
+	// the Write
+	for _, test := range []struct {
+		name  string
+		close func(*Stream) error
+		want  error
+	}{
+		{"stream close", (*Stream).Close, ErrClosedStream},
+		{"mux close", func(s *Stream) error { return s.m.Close() }, ErrClosedConn},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, writeDone := blockedWrite(t, (*Mux).DialStream)
+			if err := test.close(s); err != nil {
 				t.Fatal("Close failed:", err)
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("Close did not return")
-		}
-	})
+			waitWrite(t, writeDone, test.want)
+		})
+	}
 
 	t.Run("context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1425,61 +1501,6 @@ func BenchmarkPackets(b *testing.B) {
 				}
 			}
 		})
-	}
-}
-
-// TestCloseWithBlockedWrite is a regression test for a deadlock in Close()
-// where we would be stuck waiting for writeBuf to drain, which never happens
-// because the writeLoop might block on conn.Write due to TCP backpressure
-func TestCloseWithBlockedWrite(t *testing.T) {
-	var bc *blockConn
-	m1, m2 := newTestingPairCustom(t, func(conn net.Conn) net.Conn {
-		bc = newBlockConn(conn)
-		return bc
-	})
-	defer bc.Close() // unblock writes so cleanup doesn't hang
-
-	handleStreams(m2, func(s *Stream) error {
-		io.Copy(io.Discard, s)
-		return nil
-	})
-
-	// establish stream
-	s := m1.DialStream()
-	if _, err := s.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	// block writes
-	close(bc.blockCh)
-
-	// trigger writeLoop to block on conn.Write
-	go s.Write(make([]byte, m1.settings.maxPayloadSize()))
-
-	// wait for writeLoop to block
-	select {
-	case <-bc.blockedCh:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for conn.Write to block")
-	}
-
-	// refill writeBuf while writeLoop is stuck
-	s.Write(make([]byte, m1.settings.maxPayloadSize()))
-
-	// assert Close returns immediately
-	closeDone := make(chan error, 1)
-	go func() {
-		closeDone <- m1.Close()
-	}()
-
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("Close() did not return immediately")
 	}
 }
 
