@@ -1309,6 +1309,78 @@ func TestCloseAfterTimeout(t *testing.T) {
 	}
 }
 
+// TestCloseWriteBacklog ensures that Close buffers at most
+// maxQueuedCloseFrames flagLast frames beyond the usual buffer size, and that
+// the next Close instead closes the Mux with ErrWriteBacklog, waking blocked
+// calls.
+func TestCloseWriteBacklog(t *testing.T) {
+	tests := []struct {
+		name   string
+		covert bool
+	}{
+		{"regular", false},
+		{"covert", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				m, _ := newPipeMux(t)
+				blockWriteLoop(t, m) // leaves both buffers empty
+				dial := func() *Stream {
+					s := m.DialStream()
+					s.covert = test.covert
+					return s
+				}
+				// the peer never reads, so mark the stream as established
+				// instead of writing to it
+				closeEstablished := func() error {
+					s := dial()
+					s.established = true
+					return s.Close()
+				}
+
+				m.mu.Lock()
+				_, maxBufSize := m.writeBufFor(test.covert)
+				m.mu.Unlock()
+				for range (maxBufSize + maxQueuedCloseFrames*frameHeaderSize) / frameHeaderSize {
+					if err := closeEstablished(); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				// the buffer is past its usual size, so these block
+				acceptErr := make(chan error, 1)
+				go func() {
+					_, err := m.AcceptStream()
+					acceptErr <- err
+				}()
+				writeErr := make(chan error, 1)
+				go func() {
+					_, err := dial().Write([]byte{1})
+					writeErr <- err
+				}()
+				synctest.Wait()
+
+				m.mu.Lock()
+				bufLen := len(m.writeBuf) + len(m.covertBuf)
+				m.mu.Unlock()
+				if err := closeEstablished(); err != ErrWriteBacklog {
+					t.Fatalf("expected ErrWriteBacklog, got %v", err)
+				} else if err := <-acceptErr; err != ErrWriteBacklog {
+					t.Fatalf("expected AcceptStream to return ErrWriteBacklog, got %v", err)
+				} else if err := <-writeErr; err != ErrWriteBacklog {
+					t.Fatalf("expected Write to return ErrWriteBacklog, got %v", err)
+				}
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				if len(m.writeBuf)+len(m.covertBuf) != bufLen {
+					t.Fatal("Close buffered a flagLast frame beyond the limit")
+				}
+			})
+		})
+	}
+}
+
 // TestCloseWithFullBuffer ensures that Close does not block when the write
 // buffer is full, and that once the peer resumes reading, every closed stream
 // sends its frames followed by exactly one flagLast frame, in close order.
