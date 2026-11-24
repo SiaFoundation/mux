@@ -37,13 +37,20 @@ var (
 const (
 	// closingStreamCleanupInterval is the time after which a closed stream will
 	// no longer be tracked as closing. After that time, receiving a frame for
-	// that stream will lead to an immediate closure of the mux.
+	// that stream will lead to an immediate closure of the mux. It is measured
+	// with m.readClock, so time that readLoop spends blocked in consumeFrame
+	// does not count. Time that the peer's readLoop spends blocked (delaying
+	// its receipt of our flagLast frame) still counts.
 	closingStreamCleanupInterval = time.Minute
 
 	// maxClosedFrames is the maximum number of frames to accept for a closed
 	// stream before we consider the peer to be acting maliciously and close the
 	// mux.
 	maxClosedFrames = 1000 // ~4MiB on default settings
+
+	// maxStreams is the maximum number of open and closing streams. The peer
+	// cannot open a stream beyond it.
+	maxStreams = 1 << 20
 
 	// maxQueuedCloseFrames is the number of flagLast frames that Close may
 	// buffer beyond the size that bufferFrame fills a buffer to. Close closes
@@ -57,15 +64,16 @@ const (
 
 // A Mux multiplexes multiple duplex Streams onto a single net.Conn.
 type Mux struct {
-	conn     net.Conn
-	cipher   *seqCipher
-	settings connSettings
+	conn      net.Conn
+	cipher    *seqCipher
+	settings  connSettings
+	readClock readClock
 
 	// all subsequent fields are guarded by mu
 	mu             sync.Mutex
 	cond           sync.Cond
 	streams        map[uint32]*Stream
-	closingStreams map[uint32]closingStream // streams closed by us
+	closingStreams map[uint32]closingStream // streams closed by us or by the peer
 	nextID         uint32
 	remKeepalives  int
 	err            error // sticky and fatal
@@ -74,18 +82,63 @@ type Mux struct {
 	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
-// closingStream is used to track streams that have been closed by us until either
-// - the peer acknowledges the closure by sending a frame with flagLast
+// closingStream is used to track streams that have been closed, by us or by
+// the peer, until either
 // - frameCount exceeds maxClosedFrames
 // - closingStreamCleanupInterval has passed
+//
+// Frames that arrive for a closing stream are discarded.
 type closingStream struct {
 	frameCount uint16
-	closed     time.Time
+	closed     time.Duration // m.readClock time
 }
 
 // addClosingStream starts tracking id as closing. The caller must hold m.mu.
 func (m *Mux) addClosingStream(id uint32) {
-	m.closingStreams[id] = closingStream{closed: time.Now()}
+	m.closingStreams[id] = closingStream{closed: m.readClock.now()}
+}
+
+// A readClock measures time during which readLoop is not blocked in
+// consumeFrame. While readLoop is blocked, the peer's frames queue up behind
+// it, so only time on this clock bounds how long a frame can have been in
+// flight.
+//
+// pause and resume are only called by readLoop; now may be called
+// concurrently with them.
+type readClock struct {
+	epoch time.Time
+
+	mu         sync.Mutex
+	paused     bool
+	pausedAt   time.Duration // clock time when the current pause began
+	pauseTotal time.Duration // total length of completed pauses
+}
+
+// pause stops the clock while readLoop is blocked in consumeFrame.
+func (c *readClock) pause() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pausedAt = time.Since(c.epoch) - c.pauseTotal
+	c.paused = true
+}
+
+// resume restarts the clock once consumeFrame returns.
+func (c *readClock) resume() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pauseTotal = time.Since(c.epoch) - c.pausedAt
+	c.paused = false
+}
+
+// now returns the time elapsed since epoch, excluding time readLoop has spent
+// blocked in consumeFrame.
+func (c *readClock) now() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.paused {
+		return c.pausedAt
+	}
+	return time.Since(c.epoch) - c.pauseTotal
 }
 
 // setErr sets the Mux error and wakes up all Mux-related goroutines. If m.err
@@ -291,8 +344,9 @@ func (m *Mux) writeLoop() {
 func (m *Mux) pruneClosedStreams() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := m.readClock.now()
 	for id, cs := range m.closingStreams {
-		if time.Since(cs.closed) > closingStreamCleanupInterval {
+		if now-cs.closed > closingStreamCleanupInterval {
 			delete(m.closingStreams, id)
 		}
 	}
@@ -380,14 +434,16 @@ func (m *Mux) readLoop() {
 			if h.flags&flagFirst == 0 {
 				// received a frame for a stream that we don't know at all
 				m.mu.Unlock()
-				m.setErr(ErrUnknownStream)
+				m.setErr(fmt.Errorf("%w (%v) (covert=%v, length=%v, flags=%v)", ErrUnknownStream, h.id, covert, h.length, h.flags))
 				return
 			}
 			// create a new stream
-			const maxStreams = 1 << 20
-			if len(m.streams) > maxStreams {
+			//
+			// NOTE: closing streams count toward the limit, so that opening
+			// and closing streams cannot grow m.closingStreams without bound
+			if len(m.streams)+len(m.closingStreams) >= maxStreams {
 				m.mu.Unlock()
-				m.setErr(fmt.Errorf("exceeded concurrent stream limit (%v streams)", maxStreams))
+				m.setErr(fmt.Errorf("exceeded stream limit (%v open or closing streams)", maxStreams))
 				return
 			}
 			// If the mux is already dying, do not register a new stream.
@@ -412,12 +468,16 @@ func (m *Mux) readLoop() {
 			continue
 		}
 		m.mu.Unlock()
+		m.readClock.pause()
 		stream.consumeFrame(payload)
+		m.readClock.resume()
 	}
 }
 
 // peerClosedStream handles a flagLast frame for a stream that we have not
-// closed. The caller must hold m.mu.
+// closed. The stream is tracked as closing, because peers running older
+// versions of this package can send frames after their flagLast frame. The
+// caller must hold m.mu.
 func (m *Mux) peerClosedStream(s *Stream, h frameHeader, payload []byte) {
 	err := ErrPeerClosedStream
 	if h.flags&flagError != 0 {
@@ -429,6 +489,7 @@ func (m *Mux) peerClosedStream(s *Stream, h frameHeader, payload []byte) {
 	s.cond.L.Unlock()
 
 	delete(m.streams, s.id)
+	m.addClosingStream(s.id)
 	m.bufferCond.Broadcast() // wake Write so it can observe s.err
 }
 
@@ -535,6 +596,7 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 		cipher:         cipher,
 		closingStreams: make(map[uint32]closingStream),
 		settings:       settings,
+		readClock:      readClock{epoch: time.Now()},
 		streams:        make(map[uint32]*Stream),
 		nextID:         idLowestStream,
 		remKeepalives:  maxKeepalives,

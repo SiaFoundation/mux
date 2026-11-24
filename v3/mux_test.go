@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,23 +36,31 @@ func newTestingPairCustom(tb testing.TB, wrapConn func(net.Conn) net.Conn) (dial
 	if err != nil {
 		tb.Fatal(err)
 	}
-	errChan := make(chan error, 1)
-	go func() {
-		conn, err := l.Accept()
-		if err == nil {
-			accepted, err = AcceptAnonymous(conn, 3)
-		}
-		errChan <- err
-	}()
-
-	conn, err := net.Dial("tcp", l.Addr().String())
+	defer l.Close()
+	dialConn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		tb.Fatal(err)
+	}
+	acceptConn, err := l.Accept()
 	if err != nil {
 		tb.Fatal(err)
 	}
 	if wrapConn != nil {
-		conn = wrapConn(conn)
+		dialConn = wrapConn(dialConn)
 	}
-	dialed, err = DialAnonymous(conn)
+	return newMuxPair(tb, dialConn, acceptConn)
+}
+
+// newMuxPair performs a handshake over the provided conns and returns the
+// resulting Muxes, which are closed when the test finishes.
+func newMuxPair(tb testing.TB, dialConn, acceptConn net.Conn) (dialed, accepted *Mux) {
+	errChan := make(chan error, 1)
+	go func() {
+		var err error
+		accepted, err = AcceptAnonymous(acceptConn, 3)
+		errChan <- err
+	}()
+	dialed, err := DialAnonymous(dialConn)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -130,6 +139,13 @@ func (c *blockConn) Write(b []byte) (int, error) {
 func (c *blockConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	return c.Conn.Close()
+}
+
+// newPipePair is like newTestingPair, but connects the Muxes with net.Pipe
+// instead of TCP, so that it works inside a synctest bubble.
+func newPipePair(tb testing.TB) (dialed, accepted *Mux) {
+	c1, c2 := net.Pipe()
+	return newMuxPair(tb, c1, c2)
 }
 
 // A testPeer is the peer of a Mux created by newPipeMux, simulated by the
@@ -790,6 +806,152 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	}
 }
 
+// TestDelayedFramesAfterClose ensures that frames for a closed stream are
+// discarded even if the peer's readLoop is blocked in consumeFrame for longer
+// than closingStreamCleanupInterval before it reads them.
+func TestDelayedFramesAfterClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m1, m2 := newPipePair(t)
+
+		dialAndAccept := func() (dialed, accepted *Stream) {
+			t.Helper()
+			s := m1.DialStream()
+			if _, err := s.Write([]byte{1}); err != nil {
+				t.Fatal(err)
+			}
+			s2, err := m2.AcceptStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s, s2
+		}
+		readByte := func(s *Stream, exp byte) {
+			t.Helper()
+			var b [1]byte
+			if _, err := io.ReadFull(s, b[:]); err != nil {
+				t.Fatal(err)
+			} else if b[0] != exp {
+				t.Fatalf("expected %v, got %v", exp, b[0])
+			}
+		}
+		s1, s1Peer := dialAndAccept()
+		readByte(s1Peer, 1)
+		// don't read from s2Peer, so that m2's readLoop blocks in consumeFrame
+		s2, s2Peer := dialAndAccept()
+
+		if _, err := s1.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		s1.SetReadDeadline(time.Now())
+		if _, err := s1.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected deadline exceeded error, got %v", err)
+		} else if err := s1.Close(); err != nil {
+			t.Fatal(err)
+		} else if err := s1Peer.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// unblock m2's readLoop long after s1 was closed; the frames queued
+		// for s1 should be discarded rather than closing m2
+		time.Sleep(3 * closingStreamCleanupInterval)
+		readByte(s2Peer, 1)
+		if _, err := s2.Write([]byte{2}); err != nil {
+			t.Fatal(err)
+		}
+		readByte(s2Peer, 2)
+	})
+}
+
+// TestPruneClosedStreams checks that closing streams are pruned after
+// closingStreamCleanupInterval, not counting time that readLoop spends blocked
+// in consumeFrame.
+func TestPruneClosedStreams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := &Mux{
+			closingStreams: make(map[uint32]closingStream),
+			readClock:      readClock{epoch: time.Now()},
+		}
+		pruneAndCheck := func(exp map[uint32]bool) {
+			t.Helper()
+			m.pruneClosedStreams()
+			for id, exp := range exp {
+				if _, ok := m.closingStreams[id]; ok != exp {
+					t.Errorf("stream %v: expected closing=%v, got %v", id, exp, ok)
+				}
+			}
+		}
+
+		id1, id2 := uint32(idLowestStream), uint32(idLowestStream+2)
+		m.addClosingStream(id1)
+		time.Sleep(closingStreamCleanupInterval / 2)
+		m.readClock.pause()
+		m.addClosingStream(id2) // closed while readLoop is blocked
+		time.Sleep(10 * closingStreamCleanupInterval)
+		pruneAndCheck(map[uint32]bool{id1: true, id2: true})
+
+		m.readClock.resume()
+		time.Sleep(closingStreamCleanupInterval / 2)
+		pruneAndCheck(map[uint32]bool{id1: true, id2: true}) // id1 is exactly at the interval
+		time.Sleep(time.Second)
+		pruneAndCheck(map[uint32]bool{id1: false, id2: true})
+		time.Sleep(closingStreamCleanupInterval / 2)
+		pruneAndCheck(map[uint32]bool{id2: false})
+	})
+}
+
+// TestReadClockConcurrent checks that readClock never runs backwards and never
+// exceeds real elapsed time while readLoop pauses and resumes it.
+func TestReadClockConcurrent(t *testing.T) {
+	c := readClock{epoch: time.Now()}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			c.pause()
+			time.Sleep(10 * time.Microsecond)
+			c.resume()
+		}
+	})
+	defer wg.Wait()
+	defer close(done)
+
+	var last time.Duration
+	for range 100000 {
+		now := c.now()
+		if now < last {
+			t.Fatalf("clock ran backwards: %v after %v", now, last)
+		} else if now > time.Since(c.epoch) {
+			t.Fatalf("clock ran ahead of real time: %v", now)
+		}
+		last = now
+	}
+}
+
+// TestStreamLimitCountsClosingStreams checks that closing streams count toward
+// the stream limit, so that a peer cannot grow m.closingStreams without bound
+// by opening and closing streams.
+func TestStreamLimitCountsClosingStreams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+
+		m.mu.Lock()
+		for i := range uint32(maxStreams) {
+			m.addClosingStream(idLowestStream + 1 + 2*i)
+		}
+		m.mu.Unlock()
+
+		peer.writeFrames(t, encodeFrame(idLowestStream+1+2*maxStreams, flagFirst, 1))
+		if _, err := m.AcceptStream(); err == nil || !strings.Contains(err.Error(), "exceeded stream limit") {
+			t.Fatalf("expected stream limit error, got %v", err)
+		}
+	})
+}
+
 // TestConcurrentFirstWrites ensures that when two Writes on a newly-dialed
 // Stream wait for buffer space at the same time, only the first frame
 // buffered has flagFirst set.
@@ -828,38 +990,6 @@ func TestConcurrentFirstWrites(t *testing.T) {
 		wg.Wait()
 		if flags[0] != flagFirst || flags[1] != 0 {
 			t.Fatalf("expected flags [%v 0], got %v", flagFirst, flags)
-		}
-	})
-}
-
-// TestFirstFrameAfterClose ensures that a frame with flagFirst set that arrives
-// after we close a stream is discarded rather than reopening the stream. Peers
-// running older versions of this package can set flagFirst on more than one
-// frame when Writes race.
-func TestFirstFrameAfterClose(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		m, peer := newPipeMux(t)
-
-		peer.writeFrames(t, encodeFrame(idLowestStream+1, flagFirst, 1))
-		s, err := m.AcceptStream()
-		if err != nil {
-			t.Fatal(err)
-		} else if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
-			t.Fatal(err)
-		} else if err := s.Close(); err != nil {
-			t.Fatal(err)
-		}
-
-		peer.writeFrames(t, encodeFrame(s.id, flagFirst, 'w'), encodeFrame(s.id, flagLast))
-		synctest.Wait() // let readLoop handle the frames
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.err != nil {
-			t.Fatal(m.err)
-		} else if len(m.streams) != 0 {
-			t.Fatalf("expected no open streams, got %v", len(m.streams))
-		} else if cs, ok := m.closingStreams[s.id]; !ok || cs.frameCount != 2 {
-			t.Fatalf("expected 2 discarded frames for closing stream, got %+v (closing=%v)", cs, ok)
 		}
 	})
 }
@@ -1453,6 +1583,82 @@ func TestCloseWithFullBuffer(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestFramesAfterPeerClose ensures that frames the peer sends after its
+// flagLast frame are discarded, whether the peer closed the stream first or we
+// did. Peers running older versions of this package can send such frames when
+// Write races Close.
+func TestFramesAfterPeerClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+
+		send := func(frames ...[]byte) {
+			t.Helper()
+			peer.writeFrames(t, frames...)
+			synctest.Wait() // let readLoop handle the frames
+			m.mu.Lock()
+			err := m.err
+			m.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		accept := func(id uint32) *Stream {
+			t.Helper()
+			send(encodeFrame(id, flagFirst, 1))
+			s, err := m.AcceptStream()
+			if err != nil {
+				t.Fatal(err)
+			} else if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
+		// checkDiscarded checks that the stream is closing and has had
+		// expFrames frames discarded
+		checkDiscarded := func(id uint32, expFrames uint16) {
+			t.Helper()
+			m.mu.Lock()
+			cs, ok := m.closingStreams[id]
+			m.mu.Unlock()
+			if !ok {
+				t.Fatalf("stream %v: expected closing stream", id)
+			} else if cs.frameCount != expFrames {
+				t.Fatalf("stream %v: expected %v discarded frames, got %v", id, expFrames, cs.frameCount)
+			}
+		}
+
+		// the peer closes first
+		peerFirst := accept(idLowestStream + 1)
+		send(encodeFrame(peerFirst.id, flagLast), encodeFrame(peerFirst.id, 0, 'z'))
+		checkDiscarded(peerFirst.id, 1)
+		if _, err := peerFirst.Read(make([]byte, 1)); err != io.EOF {
+			t.Fatalf("expected EOF, got %v", err)
+		} else if err := peerFirst.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// we close first; the writeLoop then blocks on the unread pipe
+		weFirst := accept(idLowestStream + 3)
+		if err := weFirst.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// peers running older versions of this package can set flagFirst on
+		// more than one frame; a late one must not reopen the stream
+		send(encodeFrame(weFirst.id, flagFirst, 'w'), encodeFrame(weFirst.id, flagLast), encodeFrame(weFirst.id, 0, 'x'))
+		checkDiscarded(weFirst.id, 3)
+
+		// every closing stream should expire. The first prune that can drop
+		// them runs at twice the interval.
+		time.Sleep(2*closingStreamCleanupInterval + time.Second)
+		m.mu.Lock()
+		n := len(m.closingStreams)
+		m.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("expected no closing streams after cleanup interval, got %v", n)
+		}
+	})
 }
 
 // TestCloseUnblocksWrite verifies that closing a Stream or its Mux (or
