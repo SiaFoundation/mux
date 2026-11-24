@@ -149,9 +149,10 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 
 	// if this is a normal frame, check for stream error. Upon Close, the
 	// stream's error is set to ErrClosedStream. After that, the only frame that
-	// we allow to be sent is a flagLast frame. For flagFirst, also set
-	// s.established under the same lock, otherwise a racing Close can skip
-	// flagLast and leave the peer with a phantom stream.
+	// we allow to be sent is a flagLast frame. Also set flagFirst under the
+	// same lock, so that concurrent Writes establish the stream exactly once,
+	// and so that a racing Close cannot skip flagLast and leave the peer with a
+	// phantom stream.
 	if h.flags&flagLast == 0 {
 		s.cond.L.Lock()
 		if s.err != nil {
@@ -161,7 +162,8 @@ func (m *Mux) bufferFrame(s *Stream, h frameHeader, payload []byte, deadline tim
 			m.bufferCond.Signal()
 			return s.err
 		}
-		if h.flags&flagFirst != 0 {
+		if !s.established {
+			h.flags |= flagFirst
 			s.established = true
 		}
 		s.cond.L.Unlock()
@@ -335,35 +337,36 @@ func (m *Mux) readLoop() {
 		}
 
 		// look for matching Stream
-		var stream *Stream
 		m.mu.Lock()
 		m.remKeepalives = maxKeepalives
-		if s := m.streams[h.id]; s != nil {
-			stream = s
-		} else {
-			if h.flags&flagFirst == 0 {
-				cs, ok := m.closingStreams[h.id]
-				if ok {
-					// we are encountering a frame for a stream that has already
-					// been closed. This could be a delayed frame, or it could be an
-					// attempt to flood us with garbage frames. Track how many frames
-					// we've seen for this closed stream, and if it exceeds the threshold,
-					// close the mux
-					cs.frameCount++
-					m.closingStreams[h.id] = cs
-					if cs.frameCount >= maxClosedFrames {
-						m.mu.Unlock()
-						m.setErr(ErrStreamFlood)
-						return
-					}
+		stream := m.streams[h.id]
+		if stream == nil {
+			if cs, ok := m.closingStreams[h.id]; ok {
+				// we are encountering a frame for a stream that has already
+				// been closed. This could be a delayed frame, or it could be
+				// an attempt to flood us with garbage frames. Track how many
+				// frames we've seen for this closed stream, and if it exceeds
+				// the threshold, close the mux
+				//
+				// NOTE: this applies even if the frame has flagFirst set.
+				// Peers running older versions of this package can set
+				// flagFirst on more than one frame when Writes race, and such
+				// a frame must not reopen the stream.
+				cs.frameCount++
+				m.closingStreams[h.id] = cs
+				if cs.frameCount >= maxClosedFrames {
 					m.mu.Unlock()
-				} else {
-					// received a frame for a stream that we don't know at all
-					m.mu.Unlock()
-					m.setErr(ErrUnknownStream)
+					m.setErr(ErrStreamFlood)
 					return
 				}
+				m.mu.Unlock()
 				continue
+			}
+			if h.flags&flagFirst == 0 {
+				// received a frame for a stream that we don't know at all
+				m.mu.Unlock()
+				m.setErr(ErrUnknownStream)
+				return
 			}
 			// create a new stream
 			const maxStreams = 1 << 20
@@ -679,10 +682,6 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		// check for error
 		s.cond.L.Lock()
 		err = s.err
-		var flags uint16
-		if err == nil && !s.established {
-			flags = flagFirst
-		}
 		deadline := s.wd
 		s.cond.L.Unlock()
 		if err != nil {
@@ -693,7 +692,6 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		h := frameHeader{
 			id:     s.id,
 			length: uint16(len(payload)),
-			flags:  flags,
 		}
 		err = s.m.bufferFrame(s, h, payload, deadline, s.covert)
 		if err != nil {
