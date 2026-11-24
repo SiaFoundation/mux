@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.uber.org/goleak"
@@ -129,6 +130,67 @@ func (c *blockConn) Write(b []byte) (int, error) {
 func (c *blockConn) Close() error {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	return c.Conn.Close()
+}
+
+// A testPeer is the peer of a Mux created by newPipeMux, simulated by the
+// test: it writes frames with writeFrames and reads them with nextFrame.
+type testPeer struct {
+	*packetReader
+	conn net.Conn
+}
+
+// newPipeMux returns a Mux, using defaultConnSettings, and its simulated peer.
+// Like newPipePair, it works inside a synctest bubble.
+func newPipeMux(tb testing.TB) (*Mux, *testPeer) {
+	c1, c2 := net.Pipe()
+	aead, _ := chacha20poly1305.New(make([]byte, 32))
+	m := newMux(c1, &seqCipher{aead: aead}, defaultConnSettings)
+	tb.Cleanup(func() {
+		m.Close()
+		c2.Close()
+	})
+	return m, &testPeer{
+		packetReader: &packetReader{
+			r:          c2,
+			cipher:     &seqCipher{aead: aead},
+			packetSize: defaultConnSettings.PacketSize,
+			buf:        make([]byte, 0, defaultConnSettings.PacketSize*10),
+		},
+		conn: c2,
+	}
+}
+
+// blockWriteLoop dials a stream and writes to it, then waits for the writeLoop
+// to block on the unread pipe, so that subsequent frames stay buffered.
+func blockWriteLoop(tb testing.TB, m *Mux) *Stream {
+	tb.Helper()
+	s := m.DialStream()
+	if _, err := s.Write([]byte{1}); err != nil {
+		tb.Fatal(err)
+	}
+	synctest.Wait()
+	return s
+}
+
+// writeFrames writes frames to the Mux as a single packet.
+func (p *testPeer) writeFrames(tb testing.TB, frames ...[]byte) {
+	tb.Helper()
+	settings := defaultConnSettings
+	buf := make([]byte, settings.maxFrameSize()) // zeroes are padding
+	off := 0
+	for _, f := range frames {
+		off += copy(buf[off:], f)
+	}
+	packet := encryptPackets(make([]byte, settings.PacketSize), buf, settings.PacketSize, p.cipher)
+	if _, err := p.conn.Write(packet); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+// encodeFrame returns a frame with the given header fields and payload.
+func encodeFrame(id uint32, flags uint16, payload ...byte) []byte {
+	h := frameHeader{id: id, flags: flags, length: uint16(len(payload))}
+	return appendFrame(make([]byte, 0, frameHeaderSize+len(payload)), h, payload)
 }
 
 func TestMux(t *testing.T) {
@@ -726,6 +788,80 @@ func TestWriteAfterStreamClose(t *testing.T) {
 	if _, err := s2.Write(frand.Bytes(1 << 20)); err == nil {
 		t.Fatal("didn't fail")
 	}
+}
+
+// TestConcurrentFirstWrites ensures that when two Writes on a newly-dialed
+// Stream wait for buffer space at the same time, only the first frame
+// buffered has flagFirst set.
+func TestConcurrentFirstWrites(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+		payload := make([]byte, m.settings.maxPayloadSize())
+
+		// background stream, to block the writeLoop and then fill writeBuf
+		bs := blockWriteLoop(t, m)
+		go bs.Write(make([]byte, 20*len(payload)))
+		synctest.Wait()
+
+		// both Writes wait for buffer space before either buffers a frame
+		s := m.DialStream()
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(func() {
+				if _, err := s.Write(payload); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		synctest.Wait()
+
+		buf := make([]byte, len(payload))
+		var flags []uint16
+		for len(flags) < 2 {
+			h, _, _, err := peer.nextFrame(buf)
+			if err != nil {
+				t.Fatal(err)
+			} else if h.id == s.id {
+				flags = append(flags, h.flags)
+			}
+		}
+		wg.Wait()
+		if flags[0] != flagFirst || flags[1] != 0 {
+			t.Fatalf("expected flags [%v 0], got %v", flagFirst, flags)
+		}
+	})
+}
+
+// TestFirstFrameAfterClose ensures that a frame with flagFirst set that arrives
+// after we close a stream is discarded rather than reopening the stream. Peers
+// running older versions of this package can set flagFirst on more than one
+// frame when Writes race.
+func TestFirstFrameAfterClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m, peer := newPipeMux(t)
+
+		peer.writeFrames(t, encodeFrame(idLowestStream+1, flagFirst, 1))
+		s, err := m.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		} else if _, err := io.ReadFull(s, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		} else if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		peer.writeFrames(t, encodeFrame(s.id, flagFirst, 'w'), encodeFrame(s.id, flagLast))
+		synctest.Wait() // let readLoop handle the frames
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.err != nil {
+			t.Fatal(m.err)
+		} else if len(m.streams) != 0 {
+			t.Fatalf("expected no open streams, got %v", len(m.streams))
+		} else if cs, ok := m.closingStreams[s.id]; !ok || cs.frameCount != 2 {
+			t.Fatalf("expected 2 discarded frames for closing stream, got %+v (closing=%v)", cs, ok)
+		}
+	})
 }
 
 // TestCloseUnestablishedStream ensures that closing a Stream that was dialed
