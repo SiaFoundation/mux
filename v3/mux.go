@@ -683,6 +683,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 		if err == nil && !s.established {
 			flags = flagFirst
 		}
+		deadline := s.wd
 		s.cond.L.Unlock()
 		if err != nil {
 			return
@@ -694,7 +695,7 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 			length: uint16(len(payload)),
 			flags:  flags,
 		}
-		err = s.m.bufferFrame(s, h, payload, s.wd, s.covert)
+		err = s.m.bufferFrame(s, h, payload, deadline, s.covert)
 		if err != nil {
 			return
 		}

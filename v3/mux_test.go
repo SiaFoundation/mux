@@ -363,6 +363,31 @@ func TestDeadline(t *testing.T) {
 	}
 }
 
+// TestSetWriteDeadlineDuringWrite checks, under the race detector, that Write
+// reads the write deadline while holding the Stream's lock, so that it does not
+// race with SetWriteDeadline.
+func TestSetWriteDeadlineDuringWrite(t *testing.T) {
+	m1, m2 := newTestingPair(t)
+	handleStreams(m2, func(s *Stream) error {
+		io.Copy(io.Discard, s)
+		return nil
+	})
+
+	s := m1.DialStream()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 100 {
+			s.SetWriteDeadline(time.Now().Add(time.Minute))
+		}
+	})
+	for range 100 {
+		if _, err := s.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
+}
+
 func TestContext(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
