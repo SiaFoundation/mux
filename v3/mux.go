@@ -28,25 +28,15 @@ var (
 	ErrClosedStream     = errors.New("stream was gracefully closed")
 	ErrPeerClosedStream = errors.New("peer closed stream gracefully")
 	ErrPeerClosedConn   = errors.New("peer closed underlying connection")
-	ErrStreamFlood      = errors.New("too many frames received for closed stream")
-	ErrUnknownStream    = errors.New("frame received for unknown stream")
 	ErrInactiveConn     = errors.New("connection closed due to inactivity")
 	ErrWriteBacklog     = errors.New("too many frames buffered for a peer that is not reading")
 )
 
 const (
 	// closingStreamCleanupInterval is the time after which a closed stream will
-	// no longer be tracked as closing. After that time, receiving a frame for
-	// that stream will lead to an immediate closure of the mux. It is measured
-	// with m.readClock, so time that readLoop spends blocked in consumeFrame
-	// does not count. Time that the peer's readLoop spends blocked (delaying
-	// its receipt of our flagLast frame) still counts.
+	// no longer be tracked as closing. After that time, a flagFirst frame for
+	// that stream creates a new stream. It is measured with m.readClock.
 	closingStreamCleanupInterval = time.Minute
-
-	// maxClosedFrames is the maximum number of frames to accept for a closed
-	// stream before we consider the peer to be acting maliciously and close the
-	// mux.
-	maxClosedFrames = 1000 // ~4MiB on default settings
 
 	// maxStreams is the maximum number of open and closing streams. The peer
 	// cannot open a stream beyond it.
@@ -73,7 +63,7 @@ type Mux struct {
 	mu             sync.Mutex
 	cond           sync.Cond
 	streams        map[uint32]*Stream
-	closingStreams map[uint32]closingStream // streams closed by us or by the peer
+	closingStreams map[uint32]time.Duration // closed by either side; value is m.readClock.now()
 	nextID         uint32
 	remKeepalives  int
 	err            error // sticky and fatal
@@ -82,20 +72,10 @@ type Mux struct {
 	bufferCond     sync.Cond // separate cond for waking a single bufferFrame
 }
 
-// closingStream is used to track streams that have been closed, by us or by
-// the peer, until either
-// - frameCount exceeds maxClosedFrames
-// - closingStreamCleanupInterval has passed
-//
-// Frames that arrive for a closing stream are discarded.
-type closingStream struct {
-	frameCount uint16
-	closed     time.Duration // m.readClock time
-}
-
-// addClosingStream starts tracking id as closing. The caller must hold m.mu.
+// addClosingStream starts tracking id as closing, so that a late flagFirst
+// frame does not reopen the stream. The caller must hold m.mu.
 func (m *Mux) addClosingStream(id uint32) {
-	m.closingStreams[id] = closingStream{closed: m.readClock.now()}
+	m.closingStreams[id] = m.readClock.now()
 }
 
 // A readClock measures time during which readLoop is not blocked in
@@ -109,8 +89,7 @@ type readClock struct {
 	epoch time.Time
 
 	mu         sync.Mutex
-	paused     bool
-	pausedAt   time.Duration // clock time when the current pause began
+	pauseStart time.Time     // start of the current pause; zero if running
 	pauseTotal time.Duration // total length of completed pauses
 }
 
@@ -118,16 +97,15 @@ type readClock struct {
 func (c *readClock) pause() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.pausedAt = time.Since(c.epoch) - c.pauseTotal
-	c.paused = true
+	c.pauseStart = time.Now()
 }
 
 // resume restarts the clock once consumeFrame returns.
 func (c *readClock) resume() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.pauseTotal = time.Since(c.epoch) - c.pausedAt
-	c.paused = false
+	c.pauseTotal += time.Since(c.pauseStart)
+	c.pauseStart = time.Time{}
 }
 
 // now returns the time elapsed since epoch, excluding time readLoop has spent
@@ -135,10 +113,11 @@ func (c *readClock) resume() {
 func (c *readClock) now() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.paused {
-		return c.pausedAt
+	t := c.pauseStart
+	if t.IsZero() {
+		t = time.Now()
 	}
-	return time.Since(c.epoch) - c.pauseTotal
+	return t.Sub(c.epoch) - c.pauseTotal
 }
 
 // setErr sets the Mux error and wakes up all Mux-related goroutines. If m.err
@@ -345,13 +324,13 @@ func (m *Mux) pruneClosedStreams() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.readClock.now()
-	for id, cs := range m.closingStreams {
-		if now-cs.closed > closingStreamCleanupInterval {
+	for id, closed := range m.closingStreams {
+		if now-closed > closingStreamCleanupInterval {
 			delete(m.closingStreams, id)
 		}
 	}
 	if len(m.closingStreams) == 0 {
-		m.closingStreams = make(map[uint32]closingStream) // free memory
+		m.closingStreams = make(map[uint32]time.Duration) // free memory
 	}
 }
 
@@ -410,32 +389,17 @@ func (m *Mux) readLoop() {
 		m.remKeepalives = maxKeepalives
 		stream := m.streams[h.id]
 		if stream == nil {
-			if cs, ok := m.closingStreams[h.id]; ok {
-				// we are encountering a frame for a stream that has already
-				// been closed. This could be a delayed frame, or it could be
-				// an attempt to flood us with garbage frames. Track how many
-				// frames we've seen for this closed stream, and if it exceeds
-				// the threshold, close the mux
-				//
-				// NOTE: this applies even if the frame has flagFirst set.
-				// Peers running older versions of this package can set
-				// flagFirst on more than one frame when Writes race, and such
-				// a frame must not reopen the stream.
-				cs.frameCount++
-				m.closingStreams[h.id] = cs
-				if cs.frameCount >= maxClosedFrames {
-					m.mu.Unlock()
-					m.setErr(ErrStreamFlood)
-					return
-				}
+			// discard frames for a closed stream, however late they arrive: the
+			// peer keeps writing until its readLoop, which may be blocked in
+			// consumeFrame indefinitely, reads our flagLast frame
+			//
+			// NOTE: a flagFirst frame is also discarded while the stream is
+			// closing. Peers running v1.5.4 or earlier can send more than one
+			// flagFirst frame when Writes race, and a late one must not reopen
+			// the stream.
+			if _, ok := m.closingStreams[h.id]; ok || h.flags&flagFirst == 0 {
 				m.mu.Unlock()
 				continue
-			}
-			if h.flags&flagFirst == 0 {
-				// received a frame for a stream that we don't know at all
-				m.mu.Unlock()
-				m.setErr(fmt.Errorf("%w (%v) (covert=%v, length=%v, flags=%v)", ErrUnknownStream, h.id, covert, h.length, h.flags))
-				return
 			}
 			// create a new stream
 			//
@@ -475,9 +439,9 @@ func (m *Mux) readLoop() {
 }
 
 // peerClosedStream handles a flagLast frame for a stream that we have not
-// closed. The stream is tracked as closing, because peers running older
-// versions of this package can send frames after their flagLast frame. The
-// caller must hold m.mu.
+// closed. The stream is tracked as closing, because peers running v1.5.4 or
+// earlier can send a flagFirst frame after their flagLast frame. The caller
+// must hold m.mu.
 func (m *Mux) peerClosedStream(s *Stream, h frameHeader, payload []byte) {
 	err := ErrPeerClosedStream
 	if h.flags&flagError != 0 {
@@ -594,7 +558,7 @@ func newMux(conn net.Conn, cipher *seqCipher, settings connSettings) *Mux {
 	m := &Mux{
 		conn:           conn,
 		cipher:         cipher,
-		closingStreams: make(map[uint32]closingStream),
+		closingStreams: make(map[uint32]time.Duration),
 		settings:       settings,
 		readClock:      readClock{epoch: time.Now()},
 		streams:        make(map[uint32]*Stream),
@@ -805,7 +769,8 @@ func (s *Stream) Close() error {
 	if !established {
 		// if the stream was never established (no frames were sent to the
 		// peer), don't send a flagLast frame since the peer doesn't know
-		// about this stream and would treat it as an error.
+		// about this stream; peers running v1.5.4 or earlier would treat it
+		// as an error.
 		return nil
 	} else if s.m.err != nil {
 		return s.m.err
@@ -813,7 +778,7 @@ func (s *Stream) Close() error {
 
 	// buffer the flagLast frame without waiting for buffer space; it follows
 	// any frames already buffered for the stream. The stream is tracked as
-	// closing right away, so frames the peer sends meanwhile are discarded.
+	// closing right away, so a late flagFirst frame cannot reopen it.
 	//
 	// NOTE: closing streams are pruned even while the writeLoop is blocked, so
 	// without a budget, a peer that stops reading but keeps opening streams
